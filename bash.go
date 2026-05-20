@@ -257,6 +257,9 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 			content := fmt.Sprintf("%s\n\nBackground job %s is still running.\nCommand: %s", formatted, job.ID, command)
 
 			return sdk.ToolResult{Content: content}, nil
+		case <-ctx.Done():
+			_ = t.bgMgr.Kill(job.ID)
+			return sdk.ToolResult{Content: "interrupted", IsError: true}, nil
 		}
 	}
 

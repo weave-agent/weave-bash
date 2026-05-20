@@ -16,10 +16,10 @@ Fix context cancellation in the auto-background path. Optionally align bash's ex
 ## Implementation Steps
 
 ### Task 1: Fix context cancellation in auto-background path
-- [ ] Add `case <-ctx.Done():` to the `select` at line 246
-- [ ] On cancel: kill the background job via `t.bgMgr.Kill(job.ID)` and return interrupted result
-- [ ] Write tests: auto-background command gets canceled mid-flight
-- [ ] Run extension tests — must pass
+- [x] Add `case <-ctx.Done():` to the `select` at line 246
+- [x] On cancel: kill the background job via `t.bgMgr.Kill(job.ID)` and return interrupted result
+- [x] Write tests: auto-background command gets canceled mid-flight
+- [x] Run extension tests — must pass
 
 ### Task 2: Publish generic tool.progress events
 - [ ] In `collectStream`, also publish `tool.progress` events (in addition to `tool.bash.output`)

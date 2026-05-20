@@ -565,6 +565,37 @@ func TestExecuteAutoBackground(t *testing.T) {
 		assert.True(t, result.IsError)
 		assert.Contains(t, result.Content, "background manager not available")
 	})
+
+	t.Run("returns interrupted when context canceled mid-flight", func(t *testing.T) {
+		bgMgr := NewBackgroundManager()
+		tool := &tool{bgMgr: bgMgr, timeout: 60 * time.Second}
+
+		ctx, cancel := context.WithCancel(context.Background())
+
+		// Start a long-running command with auto_background_after
+		go func() {
+			// Cancel after a short delay, before auto_background timer fires
+			time.Sleep(100 * time.Millisecond)
+			cancel()
+		}()
+
+		result, err := tool.Execute(ctx, map[string]any{
+			"command":               "echo start && sleep 30",
+			"auto_background_after": float64(5),
+		})
+		require.NoError(t, err)
+		assert.True(t, result.IsError)
+		assert.Contains(t, result.Content, "interrupted")
+
+		// Verify the job was killed
+		jobs := bgMgr.List()
+		require.Len(t, jobs, 1)
+
+		job := jobs[0]
+		job.Wait()
+		assert.True(t, job.IsDone())
+		assert.Error(t, job.ExitError())
+	})
 }
 
 func TestBackgroundJobNonZeroExitCode(t *testing.T) {
