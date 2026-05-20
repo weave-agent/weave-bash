@@ -67,6 +67,7 @@ func getSandboxer() sdk.Sandboxer {
 	return s
 }
 
+//nolint:gochecknoinits // SDK tool registration requires init
 func init() {
 	sdk.OnBusReady(func(bus sdk.Bus) {
 		bus.On("sandbox.registered", func(ev sdk.Event) error {
@@ -165,10 +166,10 @@ func resolveTimeout(args map[string]any, base time.Duration) time.Duration {
 	return timeout
 }
 
-func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult, error) {
-	command, _ := args[ParamCommand].(string)
-	jobID, _ := args["job_id"].(string)
-	killJobID, _ := args["kill_job"].(string)
+func resolveOperation(args map[string]any) (command, jobID, killJobID, errMsg string) {
+	command, _ = args[ParamCommand].(string)
+	jobID, _ = args["job_id"].(string)
+	killJobID, _ = args["kill_job"].(string)
 
 	opCount := 0
 	if command != "" {
@@ -184,11 +185,20 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 	}
 
 	if opCount == 0 {
-		return sdk.ToolResult{Content: "error: one of command, job_id, or kill_job is required", IsError: true}, nil
+		return "", "", "", "one of command, job_id, or kill_job is required"
 	}
 
 	if opCount > 1 {
-		return sdk.ToolResult{Content: "error: exactly one of command, job_id, or kill_job must be provided", IsError: true}, nil
+		return "", "", "", "exactly one of command, job_id, or kill_job must be provided"
+	}
+
+	return command, jobID, killJobID, ""
+}
+
+func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult, error) {
+	command, jobID, killJobID, errMsg := resolveOperation(args)
+	if errMsg != "" {
+		return sdk.ToolResult{Content: "error: " + errMsg, IsError: true}, nil
 	}
 
 	if killJobID != "" {
@@ -370,6 +380,7 @@ func (t *tool) executeSync(ctx context.Context, command string, timeout time.Dur
 	}
 
 	var outBuf strings.Builder
+
 	sw := &syncWriter{buf: &outBuf}
 
 	var publishProgress func()
@@ -394,6 +405,14 @@ func (t *tool) executeSync(ctx context.Context, command string, timeout time.Dur
 
 	waitErr := cmd.Wait()
 	wg.Wait()
+
+	// Publish final progress event with complete output.
+	if bus != nil {
+		bus.Publish(sdk.NewEvent(sdk.TopicToolProgress, sdk.ToolProgress{
+			ToolName: "bash",
+			Content:  sw.String(),
+		}))
+	}
 
 	fullOutput := outBuf.String()
 
@@ -449,9 +468,11 @@ func collectStream(
 		n, err := r.Read(chunk)
 		if n > 0 {
 			_, _ = outBuf.Write(chunk[:n])
+
 			if publishProgress != nil {
 				publishProgress()
 			}
+
 			lineBuf.Write(chunk[:n])
 
 			for {

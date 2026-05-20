@@ -874,6 +874,7 @@ func TestExecuteProgressEvents(t *testing.T) {
 		events := bus.Events()
 
 		var progressEvents []sdk.Event
+
 		for _, e := range events {
 			if e.Topic == sdk.TopicToolProgress {
 				progressEvents = append(progressEvents, e)
@@ -899,6 +900,7 @@ func TestExecuteProgressEvents(t *testing.T) {
 		events := bus.Events()
 
 		var progressEvents []sdk.Event
+
 		for _, e := range events {
 			if e.Topic == sdk.TopicToolProgress {
 				progressEvents = append(progressEvents, e)
@@ -928,7 +930,9 @@ func TestExecuteProgressEvents(t *testing.T) {
 		events := bus.Events()
 
 		var outputEvents []sdk.Event
+
 		var progressEvents []sdk.Event
+
 		for _, e := range events {
 			switch e.Topic {
 			case "tool.bash.output":
@@ -961,6 +965,7 @@ func TestExecuteProgressEvents(t *testing.T) {
 		events := bus.Events()
 
 		var progressEvents []sdk.Event
+
 		for _, e := range events {
 			if e.Topic == sdk.TopicToolProgress {
 				progressEvents = append(progressEvents, e)
@@ -987,6 +992,7 @@ func TestExecuteProgressEvents(t *testing.T) {
 		events := bus.Events()
 
 		var progressEvents []sdk.Event
+
 		for _, e := range events {
 			if e.Topic == sdk.TopicToolProgress {
 				progressEvents = append(progressEvents, e)
