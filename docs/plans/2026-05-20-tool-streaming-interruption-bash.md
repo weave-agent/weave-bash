@@ -22,11 +22,11 @@ Fix context cancellation in the auto-background path. Optionally align bash's ex
 - [x] Run extension tests — must pass
 
 ### Task 2: Publish generic tool.progress events
-- [ ] In `collectStream`, also publish `tool.progress` events (in addition to `tool.bash.output`)
-- [ ] Content: accumulated output so far (same as what `syncWriter` has)
-- [ ] Use `sdk.Throttle` at 200ms to avoid flooding
-- [ ] Write tests: verify `tool.progress` events are throttled and contain partial output
-- [ ] Run extension tests — must pass
+- [x] In `collectStream`, also publish `tool.progress` events (in addition to `tool.bash.output`)
+- [x] Content: accumulated output so far (same as what `syncWriter` has)
+- [x] Use `sdk.Throttle` at 200ms to avoid flooding
+- [x] Write tests: verify `tool.progress` events are throttled and contain partial output
+- [x] Run extension tests — must pass
 
 ### Task 3: Verify integration
 - [ ] Run `go test ./...` in bash extension dir

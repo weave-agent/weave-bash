@@ -370,11 +370,22 @@ func (t *tool) executeSync(ctx context.Context, command string, timeout time.Dur
 
 	outMu := &sync.Mutex{}
 
+	sw := &syncWriter{buf: &outBuf, mu: outMu}
+
+	publishProgress := sdk.Throttle(ctx, func() {
+		if bus != nil {
+			bus.Publish(sdk.NewEvent(sdk.TopicToolProgress, sdk.ToolProgress{
+				ToolName: "bash",
+				Content:  sw.String(),
+			}))
+		}
+	}, 200*time.Millisecond)
+
 	var wg sync.WaitGroup
 
 	wg.Add(2)
-	go collectStream(stdoutPipe, "stdout", bus, command, &syncWriter{buf: &outBuf, mu: outMu}, &wg)
-	go collectStream(stderrPipe, "stderr", bus, command, &syncWriter{buf: &outBuf, mu: outMu}, &wg)
+	go collectStream(stdoutPipe, "stdout", bus, command, sw, publishProgress, &wg)
+	go collectStream(stderrPipe, "stderr", bus, command, sw, publishProgress, &wg)
 
 	waitErr := cmd.Wait()
 	wg.Wait()
@@ -405,6 +416,13 @@ func (w *syncWriter) Write(p []byte) (int, error) {
 	return w.buf.Write(p)
 }
 
+func (w *syncWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	return w.buf.String()
+}
+
 // collectStream reads from r, writes raw bytes to outBuf, and publishes line
 // events to bus when a complete line is read.
 func collectStream(
@@ -413,6 +431,7 @@ func collectStream(
 	bus sdk.Bus,
 	command string,
 	outBuf io.Writer,
+	publishProgress func(),
 	wg *sync.WaitGroup,
 ) {
 	defer wg.Done()
@@ -425,6 +444,9 @@ func collectStream(
 		n, err := r.Read(chunk)
 		if n > 0 {
 			_, _ = outBuf.Write(chunk[:n])
+			if publishProgress != nil {
+				publishProgress()
+			}
 			lineBuf.Write(chunk[:n])
 
 			for {

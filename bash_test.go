@@ -860,6 +860,96 @@ func TestBackgroundJobStreamingEvents(t *testing.T) {
 	})
 }
 
+func TestExecuteProgressEvents(t *testing.T) {
+	tool := &tool{}
+
+	t.Run("publishes tool.progress events", func(t *testing.T) {
+		bus := &recordingBus{}
+		ctx := sdk.WithBus(context.Background(), bus)
+
+		result, err := tool.Execute(ctx, map[string]any{"command": "echo hello_progress"})
+		require.NoError(t, err)
+		assert.Contains(t, result.Content, "hello_progress")
+
+		events := bus.Events()
+
+		var progressEvents []sdk.Event
+		for _, e := range events {
+			if e.Topic == sdk.TopicToolProgress {
+				progressEvents = append(progressEvents, e)
+			}
+		}
+
+		require.NotEmpty(t, progressEvents, "expected at least one tool.progress event")
+
+		// Last progress event should contain full output
+		lastPayload := progressEvents[len(progressEvents)-1].Payload.(sdk.ToolProgress)
+		assert.Equal(t, "bash", lastPayload.ToolName)
+		assert.Contains(t, lastPayload.Content, "hello_progress")
+	})
+
+	t.Run("progress events contain accumulated output", func(t *testing.T) {
+		bus := &recordingBus{}
+		ctx := sdk.WithBus(context.Background(), bus)
+
+		result, err := tool.Execute(ctx, map[string]any{"command": "echo line1 && echo line2 && echo line3"})
+		require.NoError(t, err)
+		assert.Contains(t, result.Content, "line3")
+
+		events := bus.Events()
+
+		var progressEvents []sdk.Event
+		for _, e := range events {
+			if e.Topic == sdk.TopicToolProgress {
+				progressEvents = append(progressEvents, e)
+			}
+		}
+
+		require.NotEmpty(t, progressEvents)
+
+		// Progress events should contain the accumulated output
+		lastPayload := progressEvents[len(progressEvents)-1].Payload.(sdk.ToolProgress)
+		assert.Equal(t, "bash", lastPayload.ToolName)
+		assert.Contains(t, lastPayload.Content, "line1")
+		assert.Contains(t, lastPayload.Content, "line3")
+	})
+
+	t.Run("progress events are throttled", func(t *testing.T) {
+		bus := &recordingBus{}
+		ctx := sdk.WithBus(context.Background(), bus)
+
+		// seq 10 produces 10 output events but should produce far fewer progress events
+		// because the throttle deduplicates rapid calls
+		result, err := tool.Execute(ctx, map[string]any{"command": "seq 1 10"})
+		require.NoError(t, err)
+		assert.Contains(t, result.Content, "10")
+
+		events := bus.Events()
+
+		var outputEvents []sdk.Event
+		var progressEvents []sdk.Event
+		for _, e := range events {
+			switch e.Topic {
+			case "tool.bash.output":
+				outputEvents = append(outputEvents, e)
+			case sdk.TopicToolProgress:
+				progressEvents = append(progressEvents, e)
+			}
+		}
+
+		require.Len(t, outputEvents, 10, "expected 10 line output events")
+		require.NotEmpty(t, progressEvents, "expected at least one progress event")
+		assert.Less(t, len(progressEvents), len(outputEvents),
+			"progress events should be fewer than output events due to throttling")
+	})
+
+	t.Run("no progress events when bus is nil", func(t *testing.T) {
+		result, err := tool.Execute(context.Background(), map[string]any{"command": "echo hello"})
+		require.NoError(t, err)
+		assert.Contains(t, result.Content, "hello")
+	})
+}
+
 func TestExecuteCheckJob(t *testing.T) {
 	t.Run("returns output for running job", func(t *testing.T) {
 		bgMgr := NewBackgroundManager()
