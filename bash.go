@@ -79,7 +79,7 @@ func init() {
 		})
 	})
 
-	sdk.RegisterTool[BashConfig]("bash", func(cfg sdk.Config, _ sdk.PreferenceReader, bc BashConfig) (sdk.Tool, error) {
+	sdk.RegisterTool("bash", func(cfg sdk.Config, _ sdk.PreferenceReader, bc BashConfig) (sdk.Tool, error) {
 		timeout := time.Duration(bc.Timeout) * time.Second
 		if timeout <= 0 {
 			timeout = defaultTimeout
@@ -321,7 +321,7 @@ func (t *tool) killJob(jobID string) sdk.ToolResult {
 	}
 
 	if err := t.bgMgr.Kill(jobID); err != nil {
-		return sdk.ToolResult{Content: fmt.Sprintf("error: %s", err), IsError: true}
+		return sdk.ToolResult{Content: fmt.Sprintf("error: failed to kill job %s: %s", jobID, err), IsError: true}
 	}
 
 	job.Wait()
@@ -353,11 +353,15 @@ func (t *tool) executeSync(ctx context.Context, command string, timeout time.Dur
 		}
 
 		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		if errors.Is(err, syscall.ESRCH) {
-			return os.ErrProcessDone
+		if err != nil {
+			if errors.Is(err, syscall.ESRCH) {
+				return os.ErrProcessDone
+			}
+
+			return fmt.Errorf("bash: kill process: %w", err)
 		}
 
-		return fmt.Errorf("bash: kill process: %w", err)
+		return nil
 	}
 
 	stdoutPipe, err := cmd.StdoutPipe()
@@ -414,7 +418,7 @@ func (t *tool) executeSync(ctx context.Context, command string, timeout time.Dur
 		}))
 	}
 
-	fullOutput := outBuf.String()
+	fullOutput := sw.String()
 
 	if waitErr == nil {
 		result := truncate.Truncate(fullOutput, truncate.DefaultMaxLines, truncate.DefaultMaxBytes)
