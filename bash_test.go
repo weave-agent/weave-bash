@@ -137,7 +137,7 @@ func TestExecute(t *testing.T) {
 		},
 		{
 			name:      "large output truncation",
-			args:      map[string]any{"command": "seq 3000"},
+			args:      map[string]any{"command": "for i in $(seq 1 3000); do echo \"line $i\"; done"},
 			wantError: false,
 			check: func(t *testing.T, result sdk.ToolResult) {
 				assert.Contains(t, result.Content, "output truncated")
@@ -918,11 +918,12 @@ func TestExecuteProgressEvents(t *testing.T) {
 		bus := &recordingBus{}
 		ctx := sdk.WithBus(context.Background(), bus)
 
-		// seq 10 produces 10 output events but should produce far fewer progress events
-		// because the throttle deduplicates rapid calls
-		result, err := tool.Execute(ctx, map[string]any{"command": "seq 1 10"})
+		// Produce 5 lines over ~400ms so the 200ms throttle limits progress events
+		result, err := tool.Execute(ctx, map[string]any{
+			"command": "for i in 1 2 3 4 5; do echo $i; sleep 0.1; done",
+		})
 		require.NoError(t, err)
-		assert.Contains(t, result.Content, "10")
+		assert.Contains(t, result.Content, "5")
 
 		events := bus.Events()
 
@@ -937,16 +938,64 @@ func TestExecuteProgressEvents(t *testing.T) {
 			}
 		}
 
-		require.Len(t, outputEvents, 10, "expected 10 line output events")
+		require.Len(t, outputEvents, 5, "expected 5 line output events")
 		require.NotEmpty(t, progressEvents, "expected at least one progress event")
 		assert.Less(t, len(progressEvents), len(outputEvents),
 			"progress events should be fewer than output events due to throttling")
 	})
 
-	t.Run("no progress events when bus is nil", func(t *testing.T) {
+	t.Run("does not panic when bus is nil", func(t *testing.T) {
 		result, err := tool.Execute(context.Background(), map[string]any{"command": "echo hello"})
 		require.NoError(t, err)
 		assert.Contains(t, result.Content, "hello")
+	})
+
+	t.Run("progress events include stderr content", func(t *testing.T) {
+		bus := &recordingBus{}
+		ctx := sdk.WithBus(context.Background(), bus)
+
+		result, err := tool.Execute(ctx, map[string]any{"command": "echo stderr_msg >&2"})
+		require.NoError(t, err)
+		assert.Contains(t, result.Content, "stderr_msg")
+
+		events := bus.Events()
+
+		var progressEvents []sdk.Event
+		for _, e := range events {
+			if e.Topic == sdk.TopicToolProgress {
+				progressEvents = append(progressEvents, e)
+			}
+		}
+
+		require.NotEmpty(t, progressEvents)
+		lastPayload := progressEvents[len(progressEvents)-1].Payload.(sdk.ToolProgress)
+		assert.Contains(t, lastPayload.Content, "stderr_msg")
+	})
+
+	t.Run("progress events contain partial output on timeout", func(t *testing.T) {
+		bus := &recordingBus{}
+		ctx := sdk.WithBus(context.Background(), bus)
+
+		result, err := tool.Execute(ctx, map[string]any{
+			"command": "echo partial && sleep 10",
+			"timeout": float64(1),
+		})
+		require.NoError(t, err)
+		assert.True(t, result.IsError)
+		assert.Contains(t, result.Content, "partial")
+
+		events := bus.Events()
+
+		var progressEvents []sdk.Event
+		for _, e := range events {
+			if e.Topic == sdk.TopicToolProgress {
+				progressEvents = append(progressEvents, e)
+			}
+		}
+
+		require.NotEmpty(t, progressEvents, "expected at least one progress event before timeout")
+		lastPayload := progressEvents[len(progressEvents)-1].Payload.(sdk.ToolProgress)
+		assert.Contains(t, lastPayload.Content, "partial")
 	})
 }
 

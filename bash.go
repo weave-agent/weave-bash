@@ -367,10 +367,7 @@ func (t *tool) executeSync(ctx context.Context, command string, timeout time.Dur
 	}
 
 	var outBuf strings.Builder
-
-	outMu := &sync.Mutex{}
-
-	sw := &syncWriter{buf: &outBuf, mu: outMu}
+	sw := &syncWriter{buf: &outBuf}
 
 	publishProgress := sdk.Throttle(ctx, func() {
 		if bus != nil {
@@ -405,20 +402,20 @@ func (t *tool) executeSync(ctx context.Context, command string, timeout time.Dur
 // syncWriter wraps a strings.Builder with a mutex for safe concurrent writes.
 type syncWriter struct {
 	buf *strings.Builder
-	mu  *sync.Mutex
+	sync.Mutex
 }
 
 //nolint:wrapcheck // strings.Builder.Write never returns an error; wrapping is unnecessary
 func (w *syncWriter) Write(p []byte) (int, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+	w.Lock()
+	defer w.Unlock()
 
 	return w.buf.Write(p)
 }
 
 func (w *syncWriter) String() string {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+	w.Lock()
+	defer w.Unlock()
 
 	return w.buf.String()
 }
@@ -494,7 +491,7 @@ func formatResultWithTempFile(result truncate.Result, fullOutput string) string 
 
 	tmpFile, err := os.CreateTemp("", "weave-bash-*.log")
 	if err != nil {
-		return content
+		return content + "\n\nerror: could not save full output: " + err.Error()
 	}
 
 	_, writeErr := tmpFile.WriteString(fullOutput)
@@ -502,7 +499,15 @@ func formatResultWithTempFile(result truncate.Result, fullOutput string) string 
 	closeErr := tmpFile.Close()
 	if writeErr != nil || closeErr != nil {
 		_ = os.Remove(tmpFile.Name())
-		return content
+
+		var errMsg string
+		if writeErr != nil {
+			errMsg = writeErr.Error()
+		} else {
+			errMsg = closeErr.Error()
+		}
+
+		return content + "\n\nerror: could not save full output: " + errMsg
 	}
 
 	return content + "\n\nFull output saved to: " + tmpFile.Name()
