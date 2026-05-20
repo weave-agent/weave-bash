@@ -258,7 +258,10 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 
 			return sdk.ToolResult{Content: content}, nil
 		case <-ctx.Done():
-			_ = t.bgMgr.Kill(job.ID)
+			if killErr := t.bgMgr.Kill(job.ID); killErr != nil {
+				return sdk.ToolResult{Content: "interrupted (failed to kill job: " + killErr.Error() + ")", IsError: true}, nil
+			}
+
 			return sdk.ToolResult{Content: "interrupted", IsError: true}, nil
 		}
 	}
@@ -369,14 +372,19 @@ func (t *tool) executeSync(ctx context.Context, command string, timeout time.Dur
 	var outBuf strings.Builder
 	sw := &syncWriter{buf: &outBuf}
 
-	publishProgress := sdk.Throttle(ctx, func() {
-		if bus != nil {
+	var publishProgress func()
+
+	if bus != nil {
+		throttleCtx, cancelThrottle := context.WithCancel(ctx)
+		defer cancelThrottle()
+
+		publishProgress = sdk.Throttle(throttleCtx, func() {
 			bus.Publish(sdk.NewEvent(sdk.TopicToolProgress, sdk.ToolProgress{
 				ToolName: "bash",
 				Content:  sw.String(),
 			}))
-		}
-	}, 200*time.Millisecond)
+		}, 200*time.Millisecond)
+	}
 
 	var wg sync.WaitGroup
 
