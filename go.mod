@@ -2,7 +2,7 @@ module github.com/weave-agent/weave-bash
 
 go 1.26.2
 
-require github.com/weave-agent/weave v0.0.0
+require github.com/weave-agent/weave v0.0.4
 
 require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
