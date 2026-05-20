@@ -29,8 +29,8 @@ Fix context cancellation in the auto-background path. Optionally align bash's ex
 - [x] Run extension tests — must pass
 
 ### Task 3: Verify integration
-- [ ] Run `go test ./...` in bash extension dir
-- [ ] Run `make lint` if available
+- [x] Run `go test ./...` in bash extension dir
+- [x] Run `make lint` if available (no Makefile, ran `go vet ./...` instead)
 
 ## Technical Details
 
