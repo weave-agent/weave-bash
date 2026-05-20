@@ -272,6 +272,8 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 				return sdk.ToolResult{Content: "interrupted (failed to kill job: " + killErr.Error() + ")", IsError: true}, nil
 			}
 
+			job.Wait()
+
 			return sdk.ToolResult{Content: "interrupted", IsError: true}, nil
 		}
 	}
