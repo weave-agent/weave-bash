@@ -221,6 +221,71 @@ func resolveOperation(args map[string]any) (command, jobID, killJobID, errMsg st
 	return command, jobID, killJobID, ""
 }
 
+func newRequestID(prefix string) string {
+	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+}
+
+func guardianRequest(command, dir string) sdk.GuardianRequest {
+	return sdk.GuardianRequest{
+		ID:          newRequestID("bash-guardian"),
+		ToolName:    "bash",
+		Action:      sdk.GuardianActionExec,
+		Command:     command,
+		WorkingDir:  dir,
+		Description: "Execute bash command",
+		Metadata: map[string]any{
+			"operation": "command",
+		},
+	}
+}
+
+func checkGuardian(ctx context.Context, command, dir string) (sdk.GuardianRequest, *sdk.ToolResult) {
+	req := guardianRequest(command, dir)
+
+	g := getGuardian()
+	if g == nil {
+		return req, nil
+	}
+
+	decision, err := g.Decide(ctx, req)
+	if err != nil {
+		return req, &sdk.ToolResult{Content: "guardian: " + err.Error(), IsError: true}
+	}
+
+	if decision.Action == sdk.GuardianDecisionBlock {
+		return req, &sdk.ToolResult{Content: formatGuardianBlock(req, decision), IsError: true}
+	}
+
+	return req, nil
+}
+
+func formatGuardianBlock(req sdk.GuardianRequest, decision sdk.GuardianDecision) string {
+	var b strings.Builder
+
+	b.WriteString("guardian: blocked")
+	b.WriteString("\naction: ")
+	b.WriteString(string(req.Action))
+
+	rule := decision.Profile
+	if rule == "" {
+		rule = decision.MatchedGrantID
+	}
+	if rule == "" {
+		rule = decision.ID
+	}
+	if rule != "" {
+		b.WriteString("\nrule: ")
+		b.WriteString(rule)
+	}
+
+	if decision.Reason != "" {
+		b.WriteString("\nreason: ")
+		b.WriteString(decision.Reason)
+	}
+
+	return b.String()
+}
+
 func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult, error) {
 	command, jobID, killJobID, errMsg := resolveOperation(args)
 	if errMsg != "" {
@@ -235,10 +300,20 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 		return t.checkJob(jobID), nil
 	}
 
+	guardianReq, guardianResult := checkGuardian(ctx, command, t.dir)
+	if guardianResult != nil {
+		return *guardianResult, nil
+	}
+
 	if s := getSandboxer(); s != nil {
 		wrapped, err := s.WrapCommand(ctx, sdk.SandboxCommandRequest{
+			ID:         newRequestID("bash-sandbox"),
 			Command:    command,
 			WorkingDir: t.dir,
+			Metadata: map[string]any{
+				"operation":           "command",
+				"guardian_request_id": guardianReq.ID,
+			},
 		})
 		if err != nil {
 			return sdk.ToolResult{Content: "sandbox: " + err.Error(), IsError: true}, nil

@@ -33,10 +33,16 @@ func (ts *testSandboxer) ResolveExpansion(context.Context, string, sdk.SandboxEx
 	return nil
 }
 
-type testGuardian struct{}
+type testGuardian struct {
+	decideFn func(context.Context, sdk.GuardianRequest) (sdk.GuardianDecision, error)
+}
 
-func (tg *testGuardian) Decide(context.Context, sdk.GuardianRequest) (sdk.GuardianDecision, error) {
-	return sdk.GuardianDecision{}, nil
+func (tg *testGuardian) Decide(ctx context.Context, req sdk.GuardianRequest) (sdk.GuardianDecision, error) {
+	if tg.decideFn == nil {
+		return sdk.GuardianDecision{Action: sdk.GuardianDecisionAllow}, nil
+	}
+
+	return tg.decideFn(ctx, req)
 }
 func (tg *testGuardian) Resolve(context.Context, string, sdk.GuardianResolution) error {
 	return nil
@@ -466,6 +472,108 @@ func TestExecuteStreamingTimeout(t *testing.T) {
 
 		require.Len(t, outputEvents, 1)
 		assert.Equal(t, "before", outputEvents[0].Payload.(BashOutputPayload).Line)
+	})
+}
+
+func TestExecuteWithGuardian(t *testing.T) {
+	origGuardian := getGuardian()
+	origSandboxer := getSandboxer()
+
+	setGuardian(nil)
+	setSandboxer(nil)
+
+	t.Cleanup(func() {
+		setGuardian(origGuardian)
+		setSandboxer(origSandboxer)
+	})
+
+	t.Run("allow decision permits command and includes command context", func(t *testing.T) {
+		var gotReq sdk.GuardianRequest
+
+		setGuardian(&testGuardian{
+			decideFn: func(_ context.Context, req sdk.GuardianRequest) (sdk.GuardianDecision, error) {
+				gotReq = req
+
+				return sdk.GuardianDecision{
+					ID:        "decision-allow",
+					RequestID: req.ID,
+					Action:    sdk.GuardianDecisionAllow,
+				}, nil
+			},
+		})
+		setSandboxer(nil)
+
+		tool := &tool{dir: "/test/dir"}
+		result, err := tool.Execute(context.Background(), map[string]any{"command": "echo guardian_allow"})
+		require.NoError(t, err)
+		assert.False(t, result.IsError)
+		assert.Contains(t, result.Content, "guardian_allow")
+
+		assert.NotEmpty(t, gotReq.ID)
+		assert.Equal(t, "bash", gotReq.ToolName)
+		assert.Equal(t, sdk.GuardianActionExec, gotReq.Action)
+		assert.Equal(t, "echo guardian_allow", gotReq.Command)
+		assert.Equal(t, "/test/dir", gotReq.WorkingDir)
+		assert.Equal(t, "command", gotReq.Metadata["operation"])
+	})
+
+	t.Run("block decision returns clear guardian error", func(t *testing.T) {
+		sandboxCalled := false
+
+		setGuardian(&testGuardian{
+			decideFn: func(_ context.Context, req sdk.GuardianRequest) (sdk.GuardianDecision, error) {
+				return sdk.GuardianDecision{
+					ID:        "decision-block",
+					RequestID: req.ID,
+					Action:    sdk.GuardianDecisionBlock,
+					Reason:    "destructive command",
+					Profile:   "strict",
+				}, nil
+			},
+		})
+		setSandboxer(&testSandboxer{
+			wrapFn: func(context.Context, sdk.SandboxCommandRequest) (sdk.SandboxCommand, error) {
+				sandboxCalled = true
+
+				return sdk.SandboxCommand{}, nil
+			},
+		})
+
+		tool := &tool{dir: "/test/dir"}
+		result, err := tool.Execute(context.Background(), map[string]any{"command": "rm -rf /tmp/example"})
+		require.NoError(t, err)
+		assert.True(t, result.IsError)
+		assert.Contains(t, result.Content, "guardian: blocked")
+		assert.Contains(t, result.Content, "action: exec")
+		assert.Contains(t, result.Content, "rule: strict")
+		assert.Contains(t, result.Content, "reason: destructive command")
+		assert.False(t, sandboxCalled)
+	})
+
+	t.Run("missing guardian permits command", func(t *testing.T) {
+		setGuardian(nil)
+		setSandboxer(nil)
+
+		tool := &tool{}
+		result, err := tool.Execute(context.Background(), map[string]any{"command": "echo no_guardian"})
+		require.NoError(t, err)
+		assert.False(t, result.IsError)
+		assert.Contains(t, result.Content, "no_guardian")
+	})
+
+	t.Run("guardian error returns tool error", func(t *testing.T) {
+		setGuardian(&testGuardian{
+			decideFn: func(context.Context, sdk.GuardianRequest) (sdk.GuardianDecision, error) {
+				return sdk.GuardianDecision{}, errors.New("policy engine unavailable")
+			},
+		})
+		setSandboxer(nil)
+
+		tool := &tool{}
+		result, err := tool.Execute(context.Background(), map[string]any{"command": "echo blocked"})
+		require.NoError(t, err)
+		assert.True(t, result.IsError)
+		assert.Contains(t, result.Content, "guardian: policy engine unavailable")
 	})
 }
 

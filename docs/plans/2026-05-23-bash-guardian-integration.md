@@ -52,11 +52,11 @@ Update the bash tool to call guardian before execution and sandbox after guardia
 - [x] run `go test ./...` - must pass before task 2
 
 ### Task 2: Build guardian requests for bash commands
-- [ ] create `sdk.GuardianRequest` with tool name, command, cwd, and operation metadata
-- [ ] call guardian before sandbox wrapping and command execution
-- [ ] convert block decisions into clear tool errors with action, rule, and reason
-- [ ] write tests for allow, block, missing guardian, and guardian error cases
-- [ ] run `go test ./...` - must pass before task 3
+- [x] create `sdk.GuardianRequest` with tool name, command, cwd, and operation metadata
+- [x] call guardian before sandbox wrapping and command execution
+- [x] convert block decisions into clear tool errors with action, rule, and reason
+- [x] write tests for allow, block, missing guardian, and guardian error cases
+- [x] run `go test ./...` - must pass before task 3
 
 ### Task 3: Handle ask decisions and resolutions
 - [ ] wait for guardian ask resolution through `Guardian.Decide` contract behavior
