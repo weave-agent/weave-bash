@@ -857,6 +857,172 @@ func TestExecuteWithSandboxer(t *testing.T) {
 	})
 }
 
+func TestExecuteGuardianSandboxOrdering(t *testing.T) {
+	origGuardian := getGuardian()
+	origSandboxer := getSandboxer()
+
+	setGuardian(nil)
+	setSandboxer(nil)
+
+	t.Cleanup(func() {
+		setGuardian(origGuardian)
+		setSandboxer(origSandboxer)
+	})
+
+	t.Run("guardian allow runs before sandbox wrapping", func(t *testing.T) {
+		var (
+			mu    sync.Mutex
+			order []string
+		)
+
+		setGuardian(&testGuardian{
+			decideFn: func(_ context.Context, req sdk.GuardianRequest) (sdk.GuardianDecision, error) {
+				mu.Lock()
+				order = append(order, "guardian")
+				mu.Unlock()
+
+				return sdk.GuardianDecision{RequestID: req.ID, Action: sdk.GuardianDecisionAllow}, nil
+			},
+		})
+		setSandboxer(&testSandboxer{
+			wrapFn: func(_ context.Context, req sdk.SandboxCommandRequest) (sdk.SandboxCommand, error) {
+				mu.Lock()
+				order = append(order, "sandbox")
+				mu.Unlock()
+
+				return sdk.SandboxCommand{Command: req.Command, WorkingDir: req.WorkingDir}, nil
+			},
+		})
+
+		result, err := (&tool{}).Execute(context.Background(), map[string]any{"command": "printf order_ok"})
+		require.NoError(t, err)
+		assert.False(t, result.IsError)
+		assert.Equal(t, "order_ok", result.Content)
+
+		mu.Lock()
+		assert.Equal(t, []string{"guardian", "sandbox"}, order)
+		mu.Unlock()
+	})
+
+	t.Run("guardian block skips sandbox wrapping", func(t *testing.T) {
+		var (
+			mu    sync.Mutex
+			order []string
+		)
+
+		setGuardian(&testGuardian{
+			decideFn: func(_ context.Context, req sdk.GuardianRequest) (sdk.GuardianDecision, error) {
+				mu.Lock()
+				order = append(order, "guardian")
+				mu.Unlock()
+
+				return sdk.GuardianDecision{
+					RequestID: req.ID,
+					Action:    sdk.GuardianDecisionBlock,
+					Reason:    "blocked before containment",
+				}, nil
+			},
+		})
+		setSandboxer(&testSandboxer{
+			wrapFn: func(_ context.Context, req sdk.SandboxCommandRequest) (sdk.SandboxCommand, error) {
+				mu.Lock()
+				order = append(order, "sandbox")
+				mu.Unlock()
+
+				return sdk.SandboxCommand{Command: req.Command, WorkingDir: req.WorkingDir}, nil
+			},
+		})
+
+		result, err := (&tool{}).Execute(context.Background(), map[string]any{"command": "printf blocked_should_not_run"})
+		require.NoError(t, err)
+		assert.True(t, result.IsError)
+		assert.Contains(t, result.Content, "reason: blocked before containment")
+
+		mu.Lock()
+		assert.Equal(t, []string{"guardian"}, order)
+		mu.Unlock()
+	})
+}
+
+func TestExecuteUsesSandboxWrappedCommandAndWorkingDir(t *testing.T) {
+	origGuardian := getGuardian()
+	origSandboxer := getSandboxer()
+
+	setGuardian(&testGuardian{})
+	setSandboxer(nil)
+
+	t.Cleanup(func() {
+		setGuardian(origGuardian)
+		setSandboxer(origSandboxer)
+	})
+
+	t.Run("foreground execution uses wrapped command and working directory", func(t *testing.T) {
+		originalDir := t.TempDir()
+		wrappedDir := t.TempDir()
+
+		setSandboxer(&testSandboxer{
+			wrapFn: func(_ context.Context, req sdk.SandboxCommandRequest) (sdk.SandboxCommand, error) {
+				assert.Equal(t, originalDir, req.WorkingDir)
+
+				return sdk.SandboxCommand{
+					Command:    "pwd && printf wrapped_foreground",
+					WorkingDir: wrappedDir,
+				}, nil
+			},
+		})
+
+		result, err := (&tool{dir: originalDir}).Execute(context.Background(), map[string]any{"command": "printf original_foreground"})
+		require.NoError(t, err)
+		assert.False(t, result.IsError)
+		assert.Contains(t, result.Content, wrappedDir)
+		assert.Contains(t, result.Content, "wrapped_foreground")
+		assert.NotContains(t, result.Content, "original_foreground")
+	})
+
+	t.Run("background execution uses wrapped command and working directory", func(t *testing.T) {
+		originalDir := t.TempDir()
+		wrappedDir := t.TempDir()
+		bgMgr := NewBackgroundManager()
+
+		setSandboxer(&testSandboxer{
+			wrapFn: func(_ context.Context, req sdk.SandboxCommandRequest) (sdk.SandboxCommand, error) {
+				assert.Equal(t, originalDir, req.WorkingDir)
+
+				return sdk.SandboxCommand{
+					Command:    "pwd && printf wrapped_background",
+					WorkingDir: wrappedDir,
+				}, nil
+			},
+		})
+
+		result, err := (&tool{dir: originalDir, bgMgr: bgMgr, timeout: 10 * time.Second}).Execute(context.Background(), map[string]any{
+			"command":           "printf original_background",
+			"run_in_background": true,
+		})
+		require.NoError(t, err)
+		assert.False(t, result.IsError)
+		assert.Contains(t, result.Content, "wrapped_background")
+		assert.NotContains(t, result.Content, "original_background")
+
+		var jobID string
+		for line := range strings.SplitSeq(result.Content, "\n") {
+			if id, ok := strings.CutPrefix(line, "Background job started: "); ok {
+				jobID = id
+				break
+			}
+		}
+
+		require.NotEmpty(t, jobID)
+		job, ok := bgMgr.Get(jobID)
+		require.True(t, ok)
+		job.Wait()
+
+		assert.Contains(t, job.Command, "wrapped_background")
+		assert.Contains(t, job.Output(), wrappedDir)
+		assert.Contains(t, job.Output(), "wrapped_background")
+	})
+}
+
 func TestExecuteRunInBackground(t *testing.T) {
 	t.Run("starts background job and returns job ID", func(t *testing.T) {
 		bgMgr := NewBackgroundManager()

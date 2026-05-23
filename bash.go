@@ -313,11 +313,13 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 		return *guardianResult, nil
 	}
 
+	execDir := t.dir
+
 	if s := getSandboxer(); s != nil {
 		wrapped, err := s.WrapCommand(ctx, sdk.SandboxCommandRequest{
 			ID:         newRequestID("bash-sandbox"),
 			Command:    command,
-			WorkingDir: t.dir,
+			WorkingDir: execDir,
 			Metadata: map[string]any{
 				"operation":           "command",
 				"guardian_request_id": guardianReq.ID,
@@ -328,6 +330,9 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 		}
 
 		command = wrapped.Command
+		if wrapped.WorkingDir != "" {
+			execDir = wrapped.WorkingDir
+		}
 	}
 
 	timeout := resolveTimeout(args, t.timeout)
@@ -348,7 +353,7 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 			return sdk.ToolResult{Content: "error: background manager not available", IsError: true}, nil
 		}
 
-		job := t.bgMgr.Start(command, t.dir, timeout, bus)
+		job := t.bgMgr.Start(command, execDir, timeout, bus)
 
 		return sdk.ToolResult{
 			Content: fmt.Sprintf("Background job started: %s\nCommand: %s\nWait for completion or check output later.", job.ID, command),
@@ -360,7 +365,7 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 			return sdk.ToolResult{Content: "error: background manager not available", IsError: true}, nil
 		}
 
-		job := t.bgMgr.Start(command, t.dir, timeout, bus)
+		job := t.bgMgr.Start(command, execDir, timeout, bus)
 
 		timer := time.NewTimer(time.Duration(autoBackgroundAfter) * time.Second)
 		defer timer.Stop()
@@ -390,7 +395,7 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 		}
 	}
 
-	return t.executeSync(ctx, command, timeout, bus)
+	return t.executeSync(ctx, command, execDir, timeout, bus)
 }
 
 func (t *tool) checkJob(jobID string) sdk.ToolResult {
@@ -448,15 +453,15 @@ func (t *tool) killJob(jobID string) sdk.ToolResult {
 	return sdk.ToolResult{Content: content, IsError: false}
 }
 
-func (t *tool) executeSync(ctx context.Context, command string, timeout time.Duration, bus sdk.Bus) (sdk.ToolResult, error) {
+func (t *tool) executeSync(ctx context.Context, command, dir string, timeout time.Duration, bus sdk.Bus) (sdk.ToolResult, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "bash", "-c", command)
 
-	if t.dir != "" {
-		if info, err := os.Stat(t.dir); err == nil && info.IsDir() {
-			cmd.Dir = t.dir
+	if dir != "" {
+		if info, err := os.Stat(dir); err == nil && info.IsDir() {
+			cmd.Dir = dir
 		}
 	}
 

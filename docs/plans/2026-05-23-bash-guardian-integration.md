@@ -66,11 +66,11 @@ Update the bash tool to call guardian before execution and sandbox after guardia
 - [x] run `go test ./...` - must pass before task 4
 
 ### Task 4: Apply sandbox containment after guardian allow
-- [ ] call sandbox wrapper only after guardian allows the command
-- [ ] preserve execution directory and timeout behavior
-- [ ] ensure wrapped commands are used for foreground and background execution
-- [ ] write tests proving guardian runs before sandbox and sandbox is skipped on block
-- [ ] run `go test ./...` - must pass before task 5
+- [x] call sandbox wrapper only after guardian allows the command
+- [x] preserve execution directory and timeout behavior
+- [x] ensure wrapped commands are used for foreground and background execution
+- [x] write tests proving guardian runs before sandbox and sandbox is skipped on block
+- [x] run `go test ./...` - must pass before task 5
 
 ### Task 5: Support sandbox expansion retry
 - [ ] detect sandbox expansion responses from sandbox wrapper/execution errors according to new SDK contract
