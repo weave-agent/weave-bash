@@ -46,6 +46,7 @@ type executionPlan struct {
 	args         []string
 	dir          string
 	env          []string
+	direct       bool
 	expansionReq *sdk.SandboxExpansionRequest
 }
 
@@ -339,6 +340,7 @@ func sandboxPlan(ctx context.Context, s sdk.Sandboxer, command, dir, guardianReq
 	}
 
 	plan.command = wrapped.Command
+	plan.direct = true
 	if len(wrapped.Args) > 0 {
 		plan.args = append([]string(nil), wrapped.Args...)
 	}
@@ -382,7 +384,12 @@ func requestSandboxExpansion(ctx context.Context, s sdk.Sandboxer, req sdk.Sandb
 		return nil, &sdk.ToolResult{Content: "sandbox expansion: " + err.Error(), IsError: true}
 	}
 
-	if expansion.State != sdk.SandboxExpansionAllowed {
+	switch expansion.State {
+	case sdk.SandboxExpansionAllowed:
+		return &expansion, nil
+	case sdk.SandboxExpansionPending:
+		return nil, &sdk.ToolResult{Content: "sandbox expansion pending: expansion was not approved before command execution", IsError: true}
+	default:
 		reason := expansion.Reason
 		if reason == "" && expansion.Resolution != nil {
 			reason = expansion.Resolution.Reason
@@ -393,8 +400,6 @@ func requestSandboxExpansion(ctx context.Context, s sdk.Sandboxer, req sdk.Sandb
 
 		return nil, &sdk.ToolResult{Content: "sandbox expansion denied: " + reason, IsError: true}
 	}
-
-	return &expansion, nil
 }
 
 func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult, error) {
@@ -443,6 +448,7 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 	execArgs := plan.args
 	execDir = plan.dir
 	execEnv := plan.env
+	execDirect := plan.direct
 
 	timeout := resolveTimeout(args, t.timeout)
 	runInBackground, _ := args["run_in_background"].(bool)
@@ -462,7 +468,7 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 			return sdk.ToolResult{Content: "error: background manager not available", IsError: true}, nil
 		}
 
-		job := t.bgMgr.Start(command, execArgs, execDir, execEnv, timeout, bus)
+		job := t.bgMgr.Start(command, execArgs, execDir, execEnv, execDirect, timeout, bus)
 
 		return sdk.ToolResult{
 			Content: fmt.Sprintf("Background job started: %s\nCommand: %s\nWait for completion or check output later.", job.ID, command),
@@ -474,7 +480,7 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 			return sdk.ToolResult{Content: "error: background manager not available", IsError: true}, nil
 		}
 
-		job := t.bgMgr.Start(command, execArgs, execDir, execEnv, timeout, bus)
+		job := t.bgMgr.Start(command, execArgs, execDir, execEnv, execDirect, timeout, bus)
 
 		timer := time.NewTimer(time.Duration(autoBackgroundAfter) * time.Second)
 		defer timer.Stop()
@@ -504,7 +510,7 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 		}
 	}
 
-	return t.executeSync(ctx, command, execArgs, execDir, execEnv, timeout, bus)
+	return t.executeSync(ctx, command, execArgs, execDir, execEnv, execDirect, timeout, bus)
 }
 
 func (t *tool) checkJob(jobID string) sdk.ToolResult {
@@ -562,11 +568,11 @@ func (t *tool) killJob(jobID string) sdk.ToolResult {
 	return sdk.ToolResult{Content: content, IsError: false}
 }
 
-func (t *tool) executeSync(ctx context.Context, command string, args []string, dir string, env []string, timeout time.Duration, bus sdk.Bus) (sdk.ToolResult, error) {
+func (t *tool) executeSync(ctx context.Context, command string, args []string, dir string, env []string, direct bool, timeout time.Duration, bus sdk.Bus) (sdk.ToolResult, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := newExecCommand(ctx, command, args, env)
+	cmd := newExecCommand(ctx, command, args, env, direct)
 
 	if dir != "" {
 		if info, err := os.Stat(dir); err == nil && info.IsDir() {
@@ -658,8 +664,8 @@ func (t *tool) executeSync(ctx context.Context, command string, args []string, d
 	return sdk.ToolResult{Content: content, IsError: isErr}, nil
 }
 
-func newExecCommand(ctx context.Context, command string, args []string, env []string) *exec.Cmd {
-	if len(args) > 0 {
+func newExecCommand(ctx context.Context, command string, args []string, env []string, direct bool) *exec.Cmd {
+	if direct {
 		cmd := exec.CommandContext(ctx, command, args...)
 		if len(env) > 0 {
 			cmd.Env = append(os.Environ(), env...)

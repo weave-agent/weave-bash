@@ -33,6 +33,15 @@ func TestHelperProcess(t *testing.T) {
 	os.Exit(0)
 }
 
+func writeExecutable(t *testing.T, name, content string) string {
+	t.Helper()
+
+	path := t.TempDir() + "/" + name
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o755))
+
+	return path
+}
+
 // testSandboxer is a minimal Sandboxer implementation for testing.
 type testSandboxer struct {
 	wrapFn             func(context.Context, sdk.SandboxCommandRequest) (sdk.SandboxCommand, error)
@@ -867,7 +876,7 @@ func TestExecuteWithSandboxer(t *testing.T) {
 				gotCmd, gotDir = req.Command, req.WorkingDir
 				mu.Unlock()
 
-				return sdk.SandboxCommand{Command: req.Command, WorkingDir: req.WorkingDir}, nil
+				return sdk.SandboxCommand{Command: "bash", Args: []string{"-c", req.Command}, WorkingDir: req.WorkingDir}, nil
 			},
 		}
 		setSandboxer(s)
@@ -935,7 +944,8 @@ func TestExecuteSandboxExpansionRetry(t *testing.T) {
 				retryMeta = req.Metadata
 
 				return sdk.SandboxCommand{
-					Command:    "printf expanded_wrap",
+					Command:    "bash",
+					Args:       []string{"-c", "printf expanded_wrap"},
 					WorkingDir: req.WorkingDir,
 				}, nil
 			},
@@ -1019,7 +1029,7 @@ func TestExecuteSandboxExpansionRetry(t *testing.T) {
 					}}
 				}
 
-				return sdk.SandboxCommand{Command: "printf expanded_background"}, nil
+				return sdk.SandboxCommand{Command: "bash", Args: []string{"-c", "printf expanded_background"}}, nil
 			},
 			requestExpansionFn: func(_ context.Context, req sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error) {
 				return sdk.SandboxExpansion{
@@ -1036,9 +1046,22 @@ func TestExecuteSandboxExpansionRetry(t *testing.T) {
 		})
 		require.NoError(t, err)
 		assert.False(t, result.IsError)
-		assert.Contains(t, result.Content, "expanded_background")
 		assert.NotContains(t, result.Content, "SHOULD_NOT_RUN_BACKGROUND_ORIGINAL")
 		assert.Equal(t, 2, wrapCount)
+
+		var jobID string
+		for line := range strings.SplitSeq(result.Content, "\n") {
+			if id, ok := strings.CutPrefix(line, "Background job started: "); ok {
+				jobID = id
+				break
+			}
+		}
+
+		require.NotEmpty(t, jobID)
+		job, ok := bgMgr.Get(jobID)
+		require.True(t, ok)
+		job.Wait()
+		assert.Contains(t, job.Output(), "expanded_background")
 	})
 
 	t.Run("expansion retry limit prevents repeated expansion loops", func(t *testing.T) {
@@ -1119,6 +1142,23 @@ func TestExecuteSandboxExpansionRetry(t *testing.T) {
 		assert.Contains(t, expansionResult.Content, "sandbox expansion denied: expansion was not approved")
 	})
 
+	t.Run("pending expansion returns unresolved expansion error", func(t *testing.T) {
+		result, expansionResult := requestSandboxExpansion(context.Background(), &testSandboxer{
+			requestExpansionFn: func(context.Context, sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error) {
+				return sdk.SandboxExpansion{
+					ID:        "pending-expansion",
+					RequestID: "pending-expansion-request",
+					State:     sdk.SandboxExpansionPending,
+				}, nil
+			},
+		}, sdk.SandboxExpansionRequest{ID: "pending-expansion-request"})
+		require.Nil(t, result)
+		require.NotNil(t, expansionResult)
+		assert.True(t, expansionResult.IsError)
+		assert.Contains(t, expansionResult.Content, "sandbox expansion pending")
+		assert.NotContains(t, expansionResult.Content, "sandbox expansion denied")
+	})
+
 	t.Run("blank expansion request id is generated", func(t *testing.T) {
 		var gotReq sdk.SandboxExpansionRequest
 
@@ -1166,7 +1206,7 @@ func TestExecuteGuardianSandboxOrdering(t *testing.T) {
 			wrapFn: func(_ context.Context, req sdk.SandboxCommandRequest) (sdk.SandboxCommand, error) {
 				order = append(order, "sandbox")
 
-				return sdk.SandboxCommand{Command: req.Command, WorkingDir: req.WorkingDir}, nil
+				return sdk.SandboxCommand{Command: "bash", Args: []string{"-c", req.Command}, WorkingDir: req.WorkingDir}, nil
 			},
 		})
 
@@ -1228,7 +1268,8 @@ func TestExecuteUsesSandboxWrappedCommandAndWorkingDir(t *testing.T) {
 				assert.Equal(t, originalDir, req.WorkingDir)
 
 				return sdk.SandboxCommand{
-					Command:    "pwd && printf wrapped_foreground",
+					Command:    "bash",
+					Args:       []string{"-c", "pwd && printf wrapped_foreground"},
 					WorkingDir: wrappedDir,
 				}, nil
 			},
@@ -1267,6 +1308,22 @@ func TestExecuteUsesSandboxWrappedCommandAndWorkingDir(t *testing.T) {
 		assert.NotContains(t, result.Content, "original_args_env")
 	})
 
+	t.Run("foreground execution uses zero-arg wrapped executable directly", func(t *testing.T) {
+		wrappedPath := writeExecutable(t, "wrapped zero args", "#!/bin/sh\nprintf zero_arg_foreground\n")
+
+		setSandboxer(&testSandboxer{
+			wrapFn: func(context.Context, sdk.SandboxCommandRequest) (sdk.SandboxCommand, error) {
+				return sdk.SandboxCommand{Command: wrappedPath}, nil
+			},
+		})
+
+		result, err := (&tool{}).Execute(context.Background(), map[string]any{"command": "printf original_zero_arg_foreground"})
+		require.NoError(t, err)
+		assert.False(t, result.IsError)
+		assert.Equal(t, "zero_arg_foreground", result.Content)
+		assert.NotContains(t, result.Content, "original_zero_arg_foreground")
+	})
+
 	t.Run("background execution uses wrapped command and working directory", func(t *testing.T) {
 		originalDir := t.TempDir()
 		wrappedDir := t.TempDir()
@@ -1277,7 +1334,8 @@ func TestExecuteUsesSandboxWrappedCommandAndWorkingDir(t *testing.T) {
 				assert.Equal(t, originalDir, req.WorkingDir)
 
 				return sdk.SandboxCommand{
-					Command:    "pwd && printf wrapped_background",
+					Command:    "bash",
+					Args:       []string{"-c", "pwd && printf wrapped_background"},
 					WorkingDir: wrappedDir,
 				}, nil
 			},
@@ -1289,7 +1347,6 @@ func TestExecuteUsesSandboxWrappedCommandAndWorkingDir(t *testing.T) {
 		})
 		require.NoError(t, err)
 		assert.False(t, result.IsError)
-		assert.Contains(t, result.Content, "wrapped_background")
 		assert.NotContains(t, result.Content, "original_background")
 
 		var jobID string
@@ -1305,7 +1362,6 @@ func TestExecuteUsesSandboxWrappedCommandAndWorkingDir(t *testing.T) {
 		require.True(t, ok)
 		job.Wait()
 
-		assert.Contains(t, job.Command, "wrapped_background")
 		assert.Contains(t, job.Output(), wrappedDir)
 		assert.Contains(t, job.Output(), "wrapped_background")
 	})
@@ -1351,6 +1407,39 @@ func TestExecuteUsesSandboxWrappedCommandAndWorkingDir(t *testing.T) {
 		require.True(t, ok)
 		job.Wait()
 		assert.Contains(t, job.Output(), "helper:wrapped_background_args_env:from_background_sandbox")
+	})
+
+	t.Run("background execution uses zero-arg wrapped executable directly", func(t *testing.T) {
+		wrappedPath := writeExecutable(t, "wrapped background zero args", "#!/bin/sh\nprintf zero_arg_background\n")
+		bgMgr := NewBackgroundManager()
+
+		setSandboxer(&testSandboxer{
+			wrapFn: func(context.Context, sdk.SandboxCommandRequest) (sdk.SandboxCommand, error) {
+				return sdk.SandboxCommand{Command: wrappedPath}, nil
+			},
+		})
+
+		result, err := (&tool{bgMgr: bgMgr, timeout: 10 * time.Second}).Execute(context.Background(), map[string]any{
+			"command":           "printf original_zero_arg_background",
+			"run_in_background": true,
+		})
+		require.NoError(t, err)
+		assert.False(t, result.IsError)
+		assert.NotContains(t, result.Content, "original_zero_arg_background")
+
+		var jobID string
+		for line := range strings.SplitSeq(result.Content, "\n") {
+			if id, ok := strings.CutPrefix(line, "Background job started: "); ok {
+				jobID = id
+				break
+			}
+		}
+
+		require.NotEmpty(t, jobID)
+		job, ok := bgMgr.Get(jobID)
+		require.True(t, ok)
+		job.Wait()
+		assert.Contains(t, job.Output(), "zero_arg_background")
 	})
 }
 
@@ -1504,7 +1593,7 @@ func TestExecuteAutoBackground(t *testing.T) {
 
 func TestBackgroundJobNonZeroExitCode(t *testing.T) {
 	bgMgr := NewBackgroundManager()
-	job := bgMgr.Start("exit 42", nil, "", nil, 10*time.Second, nil)
+	job := bgMgr.Start("exit 42", nil, "", nil, false, 10*time.Second, nil)
 	job.Wait()
 
 	assert.Equal(t, 42, job.ExitCode())
@@ -1518,7 +1607,7 @@ func TestBackgroundJobNonZeroExitCode(t *testing.T) {
 func TestBackgroundManagerOutput(t *testing.T) {
 	t.Run("returns output for existing job", func(t *testing.T) {
 		bgMgr := NewBackgroundManager()
-		job := bgMgr.Start("echo output_test", nil, "", nil, 10*time.Second, nil)
+		job := bgMgr.Start("echo output_test", nil, "", nil, false, 10*time.Second, nil)
 
 		job.Wait()
 
@@ -1538,7 +1627,7 @@ func TestBackgroundManagerOutput(t *testing.T) {
 func TestBackgroundManagerKill(t *testing.T) {
 	t.Run("kills a running background job", func(t *testing.T) {
 		bgMgr := NewBackgroundManager()
-		job := bgMgr.Start("sleep 30", nil, "", nil, 60*time.Second, nil)
+		job := bgMgr.Start("sleep 30", nil, "", nil, false, 60*time.Second, nil)
 
 		// Give the job a moment to start
 		time.Sleep(100 * time.Millisecond)
@@ -1565,8 +1654,8 @@ func TestBackgroundManagerList(t *testing.T) {
 
 	assert.Empty(t, bgMgr.List())
 
-	job1 := bgMgr.Start("echo one", nil, "", nil, 10*time.Second, nil)
-	job2 := bgMgr.Start("echo two", nil, "", nil, 10*time.Second, nil)
+	job1 := bgMgr.Start("echo one", nil, "", nil, false, 10*time.Second, nil)
+	job2 := bgMgr.Start("echo two", nil, "", nil, false, 10*time.Second, nil)
 
 	jobs := bgMgr.List()
 	assert.Len(t, jobs, 2)
@@ -1646,7 +1735,7 @@ func TestBackgroundJobBusEvents(t *testing.T) {
 		bus := &recordingBus{}
 		bgMgr := NewBackgroundManager()
 
-		job := bgMgr.Start("sleep 30", nil, "", nil, 60*time.Second, bus)
+		job := bgMgr.Start("sleep 30", nil, "", nil, false, 60*time.Second, bus)
 
 		time.Sleep(100 * time.Millisecond)
 
@@ -1675,7 +1764,7 @@ func TestBackgroundJobBusEvents(t *testing.T) {
 
 func TestBackgroundManagerRemove(t *testing.T) {
 	bgMgr := NewBackgroundManager()
-	job := bgMgr.Start("echo hello", nil, "", nil, 10*time.Second, nil)
+	job := bgMgr.Start("echo hello", nil, "", nil, false, 10*time.Second, nil)
 	job.Wait()
 
 	// Verify job exists
@@ -1695,7 +1784,7 @@ func TestBackgroundJobPartialLine(t *testing.T) {
 	bgMgr := NewBackgroundManager()
 
 	// printf without trailing newline produces a partial line
-	job := bgMgr.Start("printf 'no newline'", nil, "", nil, 10*time.Second, bus)
+	job := bgMgr.Start("printf 'no newline'", nil, "", nil, false, 10*time.Second, bus)
 	job.Wait()
 
 	time.Sleep(50 * time.Millisecond)
