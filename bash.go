@@ -3,6 +3,8 @@ package bash
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -64,6 +67,7 @@ var (
 	sandboxer   sdk.Sandboxer
 	guardianMu  sync.RWMutex
 	guardian    sdk.Guardian
+	requestSeq  atomic.Uint64
 )
 
 func setSandboxer(s sdk.Sandboxer) {
@@ -235,7 +239,12 @@ func resolveOperation(args map[string]any) (command, jobID, killJobID, errMsg st
 }
 
 func newRequestID(prefix string) string {
-	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		return prefix + "-" + hex.EncodeToString(b[:])
+	}
+
+	return fmt.Sprintf("%s-%d-%d", prefix, time.Now().UnixNano(), requestSeq.Add(1))
 }
 
 func guardianRequest(command, dir string) sdk.GuardianRequest {

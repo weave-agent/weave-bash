@@ -42,6 +42,28 @@ func writeExecutable(t *testing.T, name, content string) string {
 	return path
 }
 
+func TestNewRequestIDGeneratesUniquePrefixedIDs(t *testing.T) {
+	const count = 1000
+	ids := make(chan string, count)
+
+	for range count {
+		go func() {
+			ids <- newRequestID("test-prefix")
+		}()
+	}
+
+	seen := make(map[string]struct{}, count)
+	for range count {
+		id := <-ids
+		assert.True(t, strings.HasPrefix(id, "test-prefix-"))
+		if _, ok := seen[id]; ok {
+			t.Fatalf("duplicate request id: %s", id)
+		}
+
+		seen[id] = struct{}{}
+	}
+}
+
 // testSandboxer is a minimal Sandboxer implementation for testing.
 type testSandboxer struct {
 	wrapFn             func(context.Context, sdk.SandboxCommandRequest) (sdk.SandboxCommand, error)
