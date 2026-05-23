@@ -1443,6 +1443,19 @@ func TestExecuteUsesSandboxWrappedCommandAndWorkingDir(t *testing.T) {
 	})
 }
 
+func TestNewExecCommandUsesProvidedEnvExactly(t *testing.T) {
+	env := []string{"BASH_WRAPPED_ENV=from_sandbox"}
+
+	directCmd := newExecCommand(context.Background(), "printf", []string{"ok"}, env, true)
+	assert.Equal(t, env, directCmd.Env)
+
+	shellCmd := newExecCommand(context.Background(), "printf ok", nil, env, false)
+	assert.Equal(t, env, shellCmd.Env)
+
+	defaultEnvCmd := newExecCommand(context.Background(), "printf ok", nil, nil, false)
+	assert.Nil(t, defaultEnvCmd.Env)
+}
+
 func TestExecuteRunInBackground(t *testing.T) {
 	t.Run("starts background job and returns job ID", func(t *testing.T) {
 		bgMgr := NewBackgroundManager()

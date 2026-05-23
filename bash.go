@@ -668,7 +668,7 @@ func newExecCommand(ctx context.Context, command string, args []string, env []st
 	if direct {
 		cmd := exec.CommandContext(ctx, command, args...)
 		if len(env) > 0 {
-			cmd.Env = append(os.Environ(), env...)
+			cmd.Env = append([]string(nil), env...)
 		}
 
 		return cmd
@@ -676,7 +676,7 @@ func newExecCommand(ctx context.Context, command string, args []string, env []st
 
 	cmd := exec.CommandContext(ctx, "bash", "-c", command)
 	if len(env) > 0 {
-		cmd.Env = append(os.Environ(), env...)
+		cmd.Env = append([]string(nil), env...)
 	}
 
 	return cmd
