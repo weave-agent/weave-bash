@@ -41,6 +41,20 @@ type tool struct {
 	bgMgr   *BackgroundManager
 }
 
+type executionPlan struct {
+	command      string
+	dir          string
+	expansionReq *sdk.SandboxExpansionRequest
+}
+
+type sandboxExpansionRequestError interface {
+	SandboxExpansionRequest() sdk.SandboxExpansionRequest
+}
+
+type expansionRequestError interface {
+	ExpansionRequest() sdk.SandboxExpansionRequest
+}
+
 // defaultBgMgr is the shared background manager across all bash tool instances.
 // Without a singleton, jobs started by one tool instance are unreachable by
 // subsequent calls because sdk.GetTool creates a fresh instance per call.
@@ -294,6 +308,109 @@ func formatGuardianBlock(req sdk.GuardianRequest, decision sdk.GuardianDecision)
 	return b.String()
 }
 
+func sandboxPlan(ctx context.Context, s sdk.Sandboxer, command, dir, guardianRequestID string, expansion *sdk.SandboxExpansion) (executionPlan, *sdk.ToolResult) {
+	plan := executionPlan{command: command, dir: dir}
+	if s == nil {
+		return plan, nil
+	}
+
+	metadata := map[string]any{
+		"operation":           "command",
+		"guardian_request_id": guardianRequestID,
+	}
+	if expansion != nil {
+		metadata["sandbox_expansion_id"] = expansion.ID
+		metadata["sandbox_expansion_request_id"] = expansion.RequestID
+		metadata["sandbox_expansion_retry"] = true
+		if expansion.Resolution != nil {
+			metadata["sandbox_expansion_resolution"] = *expansion.Resolution
+			if expansion.Resolution.Metadata != nil {
+				for k, v := range expansion.Resolution.Metadata {
+					metadata["sandbox_expansion_"+k] = v
+				}
+			}
+		}
+	}
+
+	wrapped, err := s.WrapCommand(ctx, sdk.SandboxCommandRequest{
+		ID:         newRequestID("bash-sandbox"),
+		Command:    command,
+		WorkingDir: dir,
+		Metadata:   metadata,
+	})
+	if err != nil {
+		if req, ok := expansionRequestFromError(err); ok {
+			plan.expansionReq = &req
+
+			return plan, nil
+		}
+
+		return plan, &sdk.ToolResult{Content: "sandbox: " + err.Error(), IsError: true}
+	}
+
+	plan.command = wrapped.Command
+	if wrapped.WorkingDir != "" {
+		plan.dir = wrapped.WorkingDir
+	}
+	if req, ok := expansionRequestFromMetadata(wrapped.Metadata); ok {
+		plan.expansionReq = &req
+	}
+
+	return plan, nil
+}
+
+func expansionRequestFromError(err error) (sdk.SandboxExpansionRequest, bool) {
+	var sandboxErr sandboxExpansionRequestError
+	if errors.As(err, &sandboxErr) {
+		return sandboxErr.SandboxExpansionRequest(), true
+	}
+
+	var expansionErr expansionRequestError
+	if errors.As(err, &expansionErr) {
+		return expansionErr.ExpansionRequest(), true
+	}
+
+	return sdk.SandboxExpansionRequest{}, false
+}
+
+func expansionRequestFromMetadata(metadata map[string]any) (sdk.SandboxExpansionRequest, bool) {
+	for _, key := range []string{"sandbox_expansion_request", "expansion_request"} {
+		if req, ok := metadata[key].(sdk.SandboxExpansionRequest); ok {
+			return req, true
+		}
+		if req, ok := metadata[key].(*sdk.SandboxExpansionRequest); ok && req != nil {
+			return *req, true
+		}
+	}
+
+	return sdk.SandboxExpansionRequest{}, false
+}
+
+func requestSandboxExpansion(ctx context.Context, s sdk.Sandboxer, req sdk.SandboxExpansionRequest) (*sdk.SandboxExpansion, *sdk.ToolResult) {
+	if req.ID == "" {
+		req.ID = newRequestID("bash-sandbox-expansion")
+	}
+
+	expansion, err := s.RequestExpansion(ctx, req)
+	if err != nil {
+		return nil, &sdk.ToolResult{Content: "sandbox expansion: " + err.Error(), IsError: true}
+	}
+
+	if expansion.State != sdk.SandboxExpansionAllowed {
+		reason := expansion.Reason
+		if reason == "" && expansion.Resolution != nil {
+			reason = expansion.Resolution.Reason
+		}
+		if reason == "" {
+			reason = "expansion was not approved"
+		}
+
+		return nil, &sdk.ToolResult{Content: "sandbox expansion denied: " + reason, IsError: true}
+	}
+
+	return &expansion, nil
+}
+
 func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult, error) {
 	command, jobID, killJobID, errMsg := resolveOperation(args)
 	if errMsg != "" {
@@ -313,27 +430,31 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 		return *guardianResult, nil
 	}
 
+	originalCommand := command
 	execDir := t.dir
+	s := getSandboxer()
 
-	if s := getSandboxer(); s != nil {
-		wrapped, err := s.WrapCommand(ctx, sdk.SandboxCommandRequest{
-			ID:         newRequestID("bash-sandbox"),
-			Command:    command,
-			WorkingDir: execDir,
-			Metadata: map[string]any{
-				"operation":           "command",
-				"guardian_request_id": guardianReq.ID,
-			},
-		})
-		if err != nil {
-			return sdk.ToolResult{Content: "sandbox: " + err.Error(), IsError: true}, nil
+	plan, planResult := sandboxPlan(ctx, s, originalCommand, execDir, guardianReq.ID, nil)
+	if planResult != nil {
+		return *planResult, nil
+	}
+	if plan.expansionReq != nil {
+		expansion, expansionResult := requestSandboxExpansion(ctx, s, *plan.expansionReq)
+		if expansionResult != nil {
+			return *expansionResult, nil
 		}
 
-		command = wrapped.Command
-		if wrapped.WorkingDir != "" {
-			execDir = wrapped.WorkingDir
+		plan, planResult = sandboxPlan(ctx, s, originalCommand, execDir, guardianReq.ID, expansion)
+		if planResult != nil {
+			return *planResult, nil
+		}
+		if plan.expansionReq != nil {
+			return sdk.ToolResult{Content: "sandbox expansion retry limit reached", IsError: true}, nil
 		}
 	}
+
+	command = plan.command
+	execDir = plan.dir
 
 	timeout := resolveTimeout(args, t.timeout)
 	runInBackground, _ := args["run_in_background"].(bool)
@@ -395,7 +516,30 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 		}
 	}
 
-	return t.executeSync(ctx, command, execDir, timeout, bus)
+	result, execErr, waitErr := t.executeSync(ctx, command, execDir, timeout, bus)
+	if execErr != nil {
+		return result, execErr
+	}
+	if waitErr == nil || plan.expansionReq == nil || s == nil {
+		return result, nil
+	}
+
+	expansion, expansionResult := requestSandboxExpansion(ctx, s, *plan.expansionReq)
+	if expansionResult != nil {
+		return *expansionResult, nil
+	}
+
+	retryPlan, planResult := sandboxPlan(ctx, s, originalCommand, t.dir, guardianReq.ID, expansion)
+	if planResult != nil {
+		return *planResult, nil
+	}
+	if retryPlan.expansionReq != nil {
+		return sdk.ToolResult{Content: "sandbox expansion retry limit reached", IsError: true}, nil
+	}
+
+	result, execErr, _ = t.executeSync(ctx, retryPlan.command, retryPlan.dir, timeout, bus)
+
+	return result, execErr
 }
 
 func (t *tool) checkJob(jobID string) sdk.ToolResult {
@@ -453,7 +597,7 @@ func (t *tool) killJob(jobID string) sdk.ToolResult {
 	return sdk.ToolResult{Content: content, IsError: false}
 }
 
-func (t *tool) executeSync(ctx context.Context, command, dir string, timeout time.Duration, bus sdk.Bus) (sdk.ToolResult, error) {
+func (t *tool) executeSync(ctx context.Context, command, dir string, timeout time.Duration, bus sdk.Bus) (sdk.ToolResult, error, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -485,21 +629,21 @@ func (t *tool) executeSync(ctx context.Context, command, dir string, timeout tim
 
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
-		return sdk.ToolResult{Content: "error: " + err.Error(), IsError: true}, nil
+		return sdk.ToolResult{Content: "error: " + err.Error(), IsError: true}, nil, err
 	}
 
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
 		_ = stdoutPipe.Close()
 
-		return sdk.ToolResult{Content: "error: " + err.Error(), IsError: true}, nil
+		return sdk.ToolResult{Content: "error: " + err.Error(), IsError: true}, nil, err
 	}
 
 	if err := cmd.Start(); err != nil {
 		_ = stdoutPipe.Close()
 		_ = stderrPipe.Close()
 
-		return sdk.ToolResult{Content: "error: " + err.Error(), IsError: true}, nil
+		return sdk.ToolResult{Content: "error: " + err.Error(), IsError: true}, nil, err
 	}
 
 	var outBuf strings.Builder
@@ -541,12 +685,12 @@ func (t *tool) executeSync(ctx context.Context, command, dir string, timeout tim
 
 	if waitErr == nil {
 		result := truncate.Truncate(fullOutput, truncate.DefaultMaxLines, truncate.DefaultMaxBytes)
-		return sdk.ToolResult{Content: formatResultWithTempFile(result, fullOutput)}, nil
+		return sdk.ToolResult{Content: formatResultWithTempFile(result, fullOutput)}, nil, nil
 	}
 
 	content, isErr := formatCmdError(fullOutput, waitErr, ctx)
 
-	return sdk.ToolResult{Content: content, IsError: isErr}, nil
+	return sdk.ToolResult{Content: content, IsError: isErr}, nil, waitErr
 }
 
 // syncWriter wraps a strings.Builder with a mutex for safe concurrent writes.

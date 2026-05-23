@@ -73,11 +73,11 @@ Update the bash tool to call guardian before execution and sandbox after guardia
 - [x] run `go test ./...` - must pass before task 5
 
 ### Task 5: Support sandbox expansion retry
-- [ ] detect sandbox expansion responses from sandbox wrapper/execution errors according to new SDK contract
-- [ ] rerun once with expanded constraints when approved
-- [ ] prevent expansion retry loops with a single bounded retry per request
-- [ ] write tests for expansion approved, expansion denied, and expansion retry limit
-- [ ] run `go test ./...` - must pass before task 6
+- [x] detect sandbox expansion responses from sandbox wrapper/execution errors according to new SDK contract
+- [x] rerun once with expanded constraints when approved
+- [x] prevent expansion retry loops with a single bounded retry per request
+- [x] write tests for expansion approved, expansion denied, and expansion retry limit
+- [x] run `go test ./...` - must pass before task 6
 
 ### Task 6: Verify acceptance criteria
 - [ ] verify bash no longer calls `AllowRead`, `AllowWrite`, `Mode`, or `SetMode`

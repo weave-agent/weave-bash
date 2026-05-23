@@ -17,7 +17,9 @@ import (
 
 // testSandboxer is a minimal Sandboxer implementation for testing.
 type testSandboxer struct {
-	wrapFn func(context.Context, sdk.SandboxCommandRequest) (sdk.SandboxCommand, error)
+	wrapFn             func(context.Context, sdk.SandboxCommandRequest) (sdk.SandboxCommand, error)
+	requestExpansionFn func(context.Context, sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error)
+	resolveExpansionFn func(context.Context, string, sdk.SandboxExpansionResolution) error
 }
 
 func (ts *testSandboxer) WrapCommand(ctx context.Context, req sdk.SandboxCommandRequest) (sdk.SandboxCommand, error) {
@@ -26,11 +28,31 @@ func (ts *testSandboxer) WrapCommand(ctx context.Context, req sdk.SandboxCommand
 func (ts *testSandboxer) Status(context.Context) (sdk.SandboxStatus, error) {
 	return sdk.SandboxStatus{Availability: sdk.SandboxAvailabilityAvailable}, nil
 }
-func (ts *testSandboxer) RequestExpansion(context.Context, sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error) {
+func (ts *testSandboxer) RequestExpansion(ctx context.Context, req sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error) {
+	if ts.requestExpansionFn != nil {
+		return ts.requestExpansionFn(ctx, req)
+	}
+
 	return sdk.SandboxExpansion{}, nil
 }
-func (ts *testSandboxer) ResolveExpansion(context.Context, string, sdk.SandboxExpansionResolution) error {
+func (ts *testSandboxer) ResolveExpansion(ctx context.Context, expansionID string, resolution sdk.SandboxExpansionResolution) error {
+	if ts.resolveExpansionFn != nil {
+		return ts.resolveExpansionFn(ctx, expansionID, resolution)
+	}
+
 	return nil
+}
+
+type testSandboxExpansionError struct {
+	req sdk.SandboxExpansionRequest
+}
+
+func (e testSandboxExpansionError) Error() string {
+	return "sandbox expansion required"
+}
+
+func (e testSandboxExpansionError) SandboxExpansionRequest() sdk.SandboxExpansionRequest {
+	return e.req
 }
 
 type testGuardian struct {
@@ -854,6 +876,187 @@ func TestExecuteWithSandboxer(t *testing.T) {
 		require.NoError(t, err)
 		assert.True(t, result.IsError)
 		assert.Contains(t, result.Content, "sandbox: sandbox unavailable")
+	})
+}
+
+func TestExecuteSandboxExpansionRetry(t *testing.T) {
+	origGuardian := getGuardian()
+	origSandboxer := getSandboxer()
+
+	setGuardian(&testGuardian{})
+	setSandboxer(nil)
+
+	t.Cleanup(func() {
+		setGuardian(origGuardian)
+		setSandboxer(origSandboxer)
+	})
+
+	t.Run("approved wrap expansion retries once with expanded constraints", func(t *testing.T) {
+		var (
+			mu           sync.Mutex
+			wrapCount    int
+			expansionReq sdk.SandboxExpansionRequest
+			retryMeta    map[string]any
+		)
+
+		setSandboxer(&testSandboxer{
+			wrapFn: func(_ context.Context, req sdk.SandboxCommandRequest) (sdk.SandboxCommand, error) {
+				mu.Lock()
+				defer mu.Unlock()
+
+				wrapCount++
+				if wrapCount == 1 {
+					return sdk.SandboxCommand{}, testSandboxExpansionError{req: sdk.SandboxExpansionRequest{
+						ID:         "expansion-request-1",
+						Command:    req.Command,
+						WorkingDir: req.WorkingDir,
+						Reason:     "needs write access",
+					}}
+				}
+
+				retryMeta = req.Metadata
+
+				return sdk.SandboxCommand{
+					Command:    "printf expanded_wrap",
+					WorkingDir: req.WorkingDir,
+				}, nil
+			},
+			requestExpansionFn: func(_ context.Context, req sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error) {
+				expansionReq = req
+
+				return sdk.SandboxExpansion{
+					ID:        "expansion-1",
+					RequestID: req.ID,
+					State:     sdk.SandboxExpansionAllowed,
+					Resolution: &sdk.SandboxExpansionResolution{
+						State: sdk.SandboxExpansionAllowed,
+						Metadata: map[string]any{
+							"scope": "once",
+						},
+					},
+				}, nil
+			},
+		})
+
+		result, err := (&tool{}).Execute(context.Background(), map[string]any{"command": "printf original"})
+		require.NoError(t, err)
+		assert.False(t, result.IsError)
+		assert.Equal(t, "expanded_wrap", result.Content)
+		assert.Equal(t, "expansion-request-1", expansionReq.ID)
+
+		mu.Lock()
+		assert.Equal(t, 2, wrapCount)
+		assert.Equal(t, true, retryMeta["sandbox_expansion_retry"])
+		assert.Equal(t, "expansion-1", retryMeta["sandbox_expansion_id"])
+		assert.Equal(t, "once", retryMeta["sandbox_expansion_scope"])
+		mu.Unlock()
+	})
+
+	t.Run("denied wrap expansion returns sandbox expansion error", func(t *testing.T) {
+		setSandboxer(&testSandboxer{
+			wrapFn: func(_ context.Context, req sdk.SandboxCommandRequest) (sdk.SandboxCommand, error) {
+				return sdk.SandboxCommand{}, testSandboxExpansionError{req: sdk.SandboxExpansionRequest{
+					ID:      "expansion-request-denied",
+					Command: req.Command,
+					Reason:  "needs network",
+				}}
+			},
+			requestExpansionFn: func(_ context.Context, req sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error) {
+				return sdk.SandboxExpansion{
+					ID:        "expansion-denied",
+					RequestID: req.ID,
+					State:     sdk.SandboxExpansionDenied,
+					Reason:    "operator denied network",
+				}, nil
+			},
+		})
+
+		result, err := (&tool{}).Execute(context.Background(), map[string]any{"command": "printf denied"})
+		require.NoError(t, err)
+		assert.True(t, result.IsError)
+		assert.Contains(t, result.Content, "sandbox expansion denied: operator denied network")
+		assert.NotContains(t, result.Content, "denied\n")
+	})
+
+	t.Run("execution expansion retries failed command once", func(t *testing.T) {
+		var (
+			mu        sync.Mutex
+			wrapCount int
+		)
+
+		setSandboxer(&testSandboxer{
+			wrapFn: func(_ context.Context, req sdk.SandboxCommandRequest) (sdk.SandboxCommand, error) {
+				mu.Lock()
+				defer mu.Unlock()
+
+				wrapCount++
+				if wrapCount == 1 {
+					return sdk.SandboxCommand{
+						Command: "printf sandbox_denied >&2; exit 1",
+						Metadata: map[string]any{
+							"sandbox_expansion_request": sdk.SandboxExpansionRequest{
+								ID:      "runtime-expansion-request",
+								Command: req.Command,
+								Reason:  "runtime sandbox denial",
+							},
+						},
+					}, nil
+				}
+
+				return sdk.SandboxCommand{Command: "printf expanded_runtime"}, nil
+			},
+			requestExpansionFn: func(_ context.Context, req sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error) {
+				return sdk.SandboxExpansion{
+					ID:        "runtime-expansion",
+					RequestID: req.ID,
+					State:     sdk.SandboxExpansionAllowed,
+					Resolution: &sdk.SandboxExpansionResolution{
+						State: sdk.SandboxExpansionAllowed,
+					},
+				}, nil
+			},
+		})
+
+		result, err := (&tool{}).Execute(context.Background(), map[string]any{"command": "printf original_runtime"})
+		require.NoError(t, err)
+		assert.False(t, result.IsError)
+		assert.Equal(t, "expanded_runtime", result.Content)
+
+		mu.Lock()
+		assert.Equal(t, 2, wrapCount)
+		mu.Unlock()
+	})
+
+	t.Run("expansion retry limit prevents repeated expansion loops", func(t *testing.T) {
+		var wrapCount int
+
+		setSandboxer(&testSandboxer{
+			wrapFn: func(_ context.Context, req sdk.SandboxCommandRequest) (sdk.SandboxCommand, error) {
+				wrapCount++
+
+				return sdk.SandboxCommand{}, testSandboxExpansionError{req: sdk.SandboxExpansionRequest{
+					ID:      "loop-expansion-request",
+					Command: req.Command,
+					Reason:  "still needs expansion",
+				}}
+			},
+			requestExpansionFn: func(_ context.Context, req sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error) {
+				return sdk.SandboxExpansion{
+					ID:        "loop-expansion",
+					RequestID: req.ID,
+					State:     sdk.SandboxExpansionAllowed,
+					Resolution: &sdk.SandboxExpansionResolution{
+						State: sdk.SandboxExpansionAllowed,
+					},
+				}, nil
+			},
+		})
+
+		result, err := (&tool{}).Execute(context.Background(), map[string]any{"command": "printf loop"})
+		require.NoError(t, err)
+		assert.True(t, result.IsError)
+		assert.Contains(t, result.Content, "sandbox expansion retry limit reached")
+		assert.Equal(t, 2, wrapCount)
 	})
 }
 
