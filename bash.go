@@ -49,6 +49,8 @@ var defaultBgMgr = NewBackgroundManager()
 var (
 	sandboxerMu sync.RWMutex
 	sandboxer   sdk.Sandboxer
+	guardianMu  sync.RWMutex
+	guardian    sdk.Guardian
 )
 
 func setSandboxer(s sdk.Sandboxer) {
@@ -67,10 +69,34 @@ func getSandboxer() sdk.Sandboxer {
 	return s
 }
 
+func setGuardian(g sdk.Guardian) {
+	guardianMu.Lock()
+	guardian = g
+	guardianMu.Unlock()
+}
+
+func getGuardian() sdk.Guardian {
+	guardianMu.RLock()
+
+	g := guardian
+
+	guardianMu.RUnlock()
+
+	return g
+}
+
 //nolint:gochecknoinits // SDK tool registration requires init
 func init() {
 	sdk.OnBusReady(func(bus sdk.Bus) {
-		bus.On("sandbox.registered", func(ev sdk.Event) error {
+		bus.On(sdk.GuardianRegisteredTopic, func(ev sdk.Event) error {
+			if g, ok := ev.Payload.(sdk.Guardian); ok {
+				setGuardian(g)
+			}
+
+			return nil
+		})
+
+		bus.On(sdk.SandboxRegisteredTopic, func(ev sdk.Event) error {
 			if s, ok := ev.Payload.(sdk.Sandboxer); ok {
 				setSandboxer(s)
 			}
@@ -210,12 +236,15 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 	}
 
 	if s := getSandboxer(); s != nil {
-		wrapped, err := s.WrapCommand(command, t.dir)
+		wrapped, err := s.WrapCommand(ctx, sdk.SandboxCommandRequest{
+			Command:    command,
+			WorkingDir: t.dir,
+		})
 		if err != nil {
 			return sdk.ToolResult{Content: "sandbox: " + err.Error(), IsError: true}, nil
 		}
 
-		command = wrapped
+		command = wrapped.Command
 	}
 
 	timeout := resolveTimeout(args, t.timeout)

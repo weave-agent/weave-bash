@@ -45,11 +45,11 @@ Update the bash tool to call guardian before execution and sandbox after guardia
 ## Implementation Steps
 
 ### Task 1: Subscribe to guardian and new sandbox registrations
-- [ ] add guardian registration subscription and cached `sdk.Guardian`
-- [ ] update sandbox registration handling for new containment-only `sdk.Sandboxer`
-- [ ] remove assumptions about sandbox modes and old wrap signature
-- [ ] write tests for guardian and sandbox registration behavior
-- [ ] run `go test ./...` - must pass before task 2
+- [x] add guardian registration subscription and cached `sdk.Guardian`
+- [x] update sandbox registration handling for new containment-only `sdk.Sandboxer`
+- [x] remove assumptions about sandbox modes and old wrap signature
+- [x] write tests for guardian and sandbox registration behavior
+- [x] run `go test ./...` - must pass before task 2
 
 ### Task 2: Build guardian requests for bash commands
 - [ ] create `sdk.GuardianRequest` with tool name, command, cwd, and operation metadata

@@ -17,14 +17,33 @@ import (
 
 // testSandboxer is a minimal Sandboxer implementation for testing.
 type testSandboxer struct {
-	wrapFn func(cmd, dir string) (string, error)
+	wrapFn func(context.Context, sdk.SandboxCommandRequest) (sdk.SandboxCommand, error)
 }
 
-func (ts *testSandboxer) WrapCommand(cmd, dir string) (string, error) { return ts.wrapFn(cmd, dir) }
-func (ts *testSandboxer) AllowWrite(path string) bool                 { return true }
-func (ts *testSandboxer) AllowRead(path string) bool                  { return true }
-func (ts *testSandboxer) Mode() string                                { return "auto" }
-func (ts *testSandboxer) SetMode(string)                              {}
+func (ts *testSandboxer) WrapCommand(ctx context.Context, req sdk.SandboxCommandRequest) (sdk.SandboxCommand, error) {
+	return ts.wrapFn(ctx, req)
+}
+func (ts *testSandboxer) Status(context.Context) (sdk.SandboxStatus, error) {
+	return sdk.SandboxStatus{Availability: sdk.SandboxAvailabilityAvailable}, nil
+}
+func (ts *testSandboxer) RequestExpansion(context.Context, sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error) {
+	return sdk.SandboxExpansion{}, nil
+}
+func (ts *testSandboxer) ResolveExpansion(context.Context, string, sdk.SandboxExpansionResolution) error {
+	return nil
+}
+
+type testGuardian struct{}
+
+func (tg *testGuardian) Decide(context.Context, sdk.GuardianRequest) (sdk.GuardianDecision, error) {
+	return sdk.GuardianDecision{}, nil
+}
+func (tg *testGuardian) Resolve(context.Context, string, sdk.GuardianResolution) error {
+	return nil
+}
+func (tg *testGuardian) Snapshot(context.Context) (sdk.GuardianSnapshot, error) {
+	return sdk.GuardianSnapshot{}, nil
+}
 
 func TestRegister(t *testing.T) {
 	tool, err := sdk.GetTool("bash", nil)
@@ -265,6 +284,65 @@ func (r *recordingBus) Events() []sdk.Event {
 	return append([]sdk.Event(nil), r.events...)
 }
 
+type registrationBus struct {
+	handlers map[string][]sdk.Handler
+}
+
+func newRegistrationBus() *registrationBus {
+	return &registrationBus{handlers: make(map[string][]sdk.Handler)}
+}
+
+func (r *registrationBus) Publish(e sdk.Event) {
+	for _, h := range r.handlers[e.Topic] {
+		_ = h(e)
+	}
+}
+
+func (r *registrationBus) On(topic string, h sdk.Handler) {
+	r.handlers[topic] = append(r.handlers[topic], h)
+}
+
+func (r *registrationBus) OnAll(sdk.Handler) {}
+
+func (r *registrationBus) Off(sdk.Handler) {}
+
+func (r *registrationBus) Close() error { return nil }
+
+func TestGuardianAndSandboxRegistration(t *testing.T) {
+	origGuardian := getGuardian()
+	origSandboxer := getSandboxer()
+
+	setGuardian(nil)
+	setSandboxer(nil)
+
+	t.Cleanup(func() {
+		setGuardian(origGuardian)
+		setSandboxer(origSandboxer)
+	})
+
+	bus := newRegistrationBus()
+	sdk.InvokeBusSubscribers(bus)
+
+	g := &testGuardian{}
+	s := &testSandboxer{
+		wrapFn: func(_ context.Context, req sdk.SandboxCommandRequest) (sdk.SandboxCommand, error) {
+			return sdk.SandboxCommand{Command: req.Command, WorkingDir: req.WorkingDir}, nil
+		},
+	}
+
+	bus.Publish(sdk.NewEvent(sdk.GuardianRegisteredTopic, g))
+	bus.Publish(sdk.NewEvent(sdk.SandboxRegisteredTopic, s))
+
+	assert.Same(t, g, getGuardian())
+	assert.Same(t, s, getSandboxer())
+
+	bus.Publish(sdk.NewEvent(sdk.GuardianRegisteredTopic, "not a guardian"))
+	bus.Publish(sdk.NewEvent(sdk.SandboxRegisteredTopic, "not a sandboxer"))
+
+	assert.Same(t, g, getGuardian())
+	assert.Same(t, s, getSandboxer())
+}
+
 func TestExecuteStreaming(t *testing.T) {
 	tool := &tool{}
 
@@ -415,12 +493,12 @@ func TestExecuteWithSandboxer(t *testing.T) {
 		gotCmd, gotDir := "", ""
 
 		s := &testSandboxer{
-			wrapFn: func(cmd, dir string) (string, error) {
+			wrapFn: func(_ context.Context, req sdk.SandboxCommandRequest) (sdk.SandboxCommand, error) {
 				mu.Lock()
-				gotCmd, gotDir = cmd, dir
+				gotCmd, gotDir = req.Command, req.WorkingDir
 				mu.Unlock()
 
-				return cmd, nil
+				return sdk.SandboxCommand{Command: req.Command, WorkingDir: req.WorkingDir}, nil
 			},
 		}
 		setSandboxer(s)
@@ -437,8 +515,8 @@ func TestExecuteWithSandboxer(t *testing.T) {
 
 	t.Run("sandboxer error returns sandbox error", func(t *testing.T) {
 		s := &testSandboxer{
-			wrapFn: func(cmd, dir string) (string, error) {
-				return "", errors.New("sandbox unavailable")
+			wrapFn: func(context.Context, sdk.SandboxCommandRequest) (sdk.SandboxCommand, error) {
+				return sdk.SandboxCommand{}, errors.New("sandbox unavailable")
 			},
 		}
 		setSandboxer(s)
