@@ -252,11 +252,19 @@ func checkGuardian(ctx context.Context, command, dir string) (sdk.GuardianReques
 		return req, &sdk.ToolResult{Content: "guardian: " + err.Error(), IsError: true}
 	}
 
-	if decision.Action == sdk.GuardianDecisionBlock {
+	switch decision.Action {
+	case sdk.GuardianDecisionAllow:
+		return req, nil
+	case sdk.GuardianDecisionBlock:
+		return req, &sdk.ToolResult{Content: formatGuardianBlock(req, decision), IsError: true}
+	default:
+		decision.Action = sdk.GuardianDecisionBlock
+		if decision.Reason == "" {
+			decision.Reason = "guardian returned unresolved approval decision"
+		}
+
 		return req, &sdk.ToolResult{Content: formatGuardianBlock(req, decision), IsError: true}
 	}
-
-	return req, nil
 }
 
 func formatGuardianBlock(req sdk.GuardianRequest, decision sdk.GuardianDecision) string {

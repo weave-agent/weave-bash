@@ -59,11 +59,11 @@ Update the bash tool to call guardian before execution and sandbox after guardia
 - [x] run `go test ./...` - must pass before task 3
 
 ### Task 3: Handle ask decisions and resolutions
-- [ ] wait for guardian ask resolution through `Guardian.Decide` contract behavior
-- [ ] honor headless ask fallback returned by guardian
-- [ ] ensure timeout/cancellation uses tool context
-- [ ] write tests for approved ask, denied ask, timeout/cancel, and fallback block
-- [ ] run `go test ./...` - must pass before task 4
+- [x] wait for guardian ask resolution through `Guardian.Decide` contract behavior
+- [x] honor headless ask fallback returned by guardian
+- [x] ensure timeout/cancellation uses tool context
+- [x] write tests for approved ask, denied ask, timeout/cancel, and fallback block
+- [x] run `go test ./...` - must pass before task 4
 
 ### Task 4: Apply sandbox containment after guardian allow
 - [ ] call sandbox wrapper only after guardian allows the command

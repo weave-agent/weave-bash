@@ -577,6 +577,227 @@ func TestExecuteWithGuardian(t *testing.T) {
 	})
 }
 
+func TestExecuteWithGuardianAskDecisions(t *testing.T) {
+	origGuardian := getGuardian()
+	origSandboxer := getSandboxer()
+
+	setGuardian(nil)
+	setSandboxer(nil)
+
+	t.Cleanup(func() {
+		setGuardian(origGuardian)
+		setSandboxer(origSandboxer)
+	})
+
+	t.Run("approved ask decision permits command after Decide resolves", func(t *testing.T) {
+		decideEntered := make(chan struct{})
+		approve := make(chan struct{})
+
+		setGuardian(&testGuardian{
+			decideFn: func(ctx context.Context, req sdk.GuardianRequest) (sdk.GuardianDecision, error) {
+				close(decideEntered)
+
+				select {
+				case <-approve:
+					return sdk.GuardianDecision{
+						ID:        "decision-ask-approved",
+						RequestID: req.ID,
+						Action:    sdk.GuardianDecisionAllow,
+						Reason:    "approved",
+					}, nil
+				case <-ctx.Done():
+					return sdk.GuardianDecision{}, ctx.Err()
+				}
+			},
+		})
+		setSandboxer(nil)
+
+		done := make(chan sdk.ToolResult, 1)
+		errs := make(chan error, 1)
+
+		go func() {
+			result, err := (&tool{}).Execute(context.Background(), map[string]any{"command": "echo ask_approved"})
+			done <- result
+			errs <- err
+		}()
+
+		require.Eventually(t, func() bool {
+			select {
+			case <-decideEntered:
+				return true
+			default:
+				return false
+			}
+		}, time.Second, time.Millisecond)
+
+		select {
+		case result := <-done:
+			t.Fatalf("command executed before guardian ask resolution: %+v", result)
+		default:
+		}
+
+		close(approve)
+
+		var result sdk.ToolResult
+		require.Eventually(t, func() bool {
+			select {
+			case result = <-done:
+				return true
+			default:
+				return false
+			}
+		}, time.Second, time.Millisecond)
+		require.NoError(t, <-errs)
+		assert.False(t, result.IsError)
+		assert.Contains(t, result.Content, "ask_approved")
+	})
+
+	t.Run("denied ask decision blocks command after Decide resolves", func(t *testing.T) {
+		deny := make(chan struct{})
+		command := "printf denied_should_not_run"
+
+		setGuardian(&testGuardian{
+			decideFn: func(ctx context.Context, req sdk.GuardianRequest) (sdk.GuardianDecision, error) {
+				select {
+				case <-deny:
+					return sdk.GuardianDecision{
+						ID:        "decision-ask-denied",
+						RequestID: req.ID,
+						Action:    sdk.GuardianDecisionBlock,
+						Reason:    "denied by operator",
+						Profile:   "ask",
+					}, nil
+				case <-ctx.Done():
+					return sdk.GuardianDecision{}, ctx.Err()
+				}
+			},
+		})
+		setSandboxer(nil)
+
+		done := make(chan sdk.ToolResult, 1)
+		errs := make(chan error, 1)
+
+		go func() {
+			result, err := (&tool{}).Execute(context.Background(), map[string]any{"command": command})
+			done <- result
+			errs <- err
+		}()
+
+		close(deny)
+
+		var result sdk.ToolResult
+		require.Eventually(t, func() bool {
+			select {
+			case result = <-done:
+				return true
+			default:
+				return false
+			}
+		}, time.Second, time.Millisecond)
+		require.NoError(t, <-errs)
+		assert.True(t, result.IsError)
+		assert.Contains(t, result.Content, "guardian: blocked")
+		assert.Contains(t, result.Content, "rule: ask")
+		assert.Contains(t, result.Content, "reason: denied by operator")
+		assert.NotContains(t, result.Content, "denied_should_not_run")
+	})
+
+	t.Run("canceling tool context cancels pending ask decision", func(t *testing.T) {
+		decideCanceled := make(chan struct{})
+
+		setGuardian(&testGuardian{
+			decideFn: func(ctx context.Context, req sdk.GuardianRequest) (sdk.GuardianDecision, error) {
+				<-ctx.Done()
+				close(decideCanceled)
+
+				return sdk.GuardianDecision{
+					ID:        "decision-ask-canceled",
+					RequestID: req.ID,
+					Action:    sdk.GuardianDecisionBlock,
+					Reason:    "approval timed out",
+				}, nil
+			},
+		})
+		setSandboxer(nil)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan sdk.ToolResult, 1)
+		errs := make(chan error, 1)
+
+		go func() {
+			result, err := (&tool{}).Execute(ctx, map[string]any{"command": "printf canceled_should_not_run"})
+			done <- result
+			errs <- err
+		}()
+
+		cancel()
+
+		require.Eventually(t, func() bool {
+			select {
+			case <-decideCanceled:
+				return true
+			default:
+				return false
+			}
+		}, time.Second, time.Millisecond)
+
+		var result sdk.ToolResult
+		require.Eventually(t, func() bool {
+			select {
+			case result = <-done:
+				return true
+			default:
+				return false
+			}
+		}, time.Second, time.Millisecond)
+		require.NoError(t, <-errs)
+		assert.True(t, result.IsError)
+		assert.Contains(t, result.Content, "reason: approval timed out")
+		assert.NotContains(t, result.Content, "canceled_should_not_run")
+	})
+
+	t.Run("headless ask fallback block returned by guardian is honored", func(t *testing.T) {
+		setGuardian(&testGuardian{
+			decideFn: func(_ context.Context, req sdk.GuardianRequest) (sdk.GuardianDecision, error) {
+				return sdk.GuardianDecision{
+					ID:        "decision-headless-fallback",
+					RequestID: req.ID,
+					Action:    sdk.GuardianDecisionBlock,
+					Reason:    "action requires approval in headless mode",
+				}, nil
+			},
+		})
+		setSandboxer(nil)
+
+		result, err := (&tool{}).Execute(context.Background(), map[string]any{"command": "printf fallback_should_not_run"})
+		require.NoError(t, err)
+		assert.True(t, result.IsError)
+		assert.Contains(t, result.Content, "guardian: blocked")
+		assert.Contains(t, result.Content, "reason: action requires approval in headless mode")
+		assert.NotContains(t, result.Content, "fallback_should_not_run")
+	})
+
+	t.Run("unresolved ask action is treated as a guardian block", func(t *testing.T) {
+		setGuardian(&testGuardian{
+			decideFn: func(_ context.Context, req sdk.GuardianRequest) (sdk.GuardianDecision, error) {
+				return sdk.GuardianDecision{
+					ID:        "decision-unresolved-ask",
+					RequestID: req.ID,
+					Action:    sdk.GuardianDecisionAsk,
+				}, nil
+			},
+		})
+		setSandboxer(nil)
+
+		result, err := (&tool{}).Execute(context.Background(), map[string]any{"command": "printf unresolved_should_not_run"})
+		require.NoError(t, err)
+		assert.True(t, result.IsError)
+		assert.Contains(t, result.Content, "guardian: blocked")
+		assert.Contains(t, result.Content, "reason: guardian returned unresolved approval decision")
+		assert.NotContains(t, result.Content, "unresolved_should_not_run")
+	})
+}
+
 func TestExecuteWithSandboxer(t *testing.T) {
 	orig := getSandboxer()
 
