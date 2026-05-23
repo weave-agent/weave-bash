@@ -132,7 +132,7 @@ func buildExitResult(content string, exitCode int, exitErr error) sdk.ToolResult
 	}
 }
 
-func (j *BackgroundJob) run(ctx context.Context, cancel context.CancelFunc, command, dir string, bus sdk.Bus) {
+func (j *BackgroundJob) run(ctx context.Context, cancel context.CancelFunc, command string, args []string, dir string, env []string, bus sdk.Bus) {
 	defer close(j.done)
 	defer cancel()
 
@@ -161,7 +161,7 @@ func (j *BackgroundJob) run(ctx context.Context, cancel context.CancelFunc, comm
 		}
 	}()
 
-	cmd := exec.CommandContext(ctx, "bash", "-c", command)
+	cmd := newExecCommand(ctx, command, args, env)
 	cmd.Dir = dir
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
@@ -291,7 +291,7 @@ func NewBackgroundManager() *BackgroundManager {
 }
 
 // Start begins a new background job with the given command.
-func (bm *BackgroundManager) Start(command, dir string, timeout time.Duration, bus sdk.Bus) *BackgroundJob {
+func (bm *BackgroundManager) Start(command string, args []string, dir string, env []string, timeout time.Duration, bus sdk.Bus) *BackgroundJob {
 	bm.mu.Lock()
 	bm.counter++
 	id := fmt.Sprintf("job-%d", bm.counter)
@@ -306,7 +306,7 @@ func (bm *BackgroundManager) Start(command, dir string, timeout time.Duration, b
 	bm.jobs[id] = job
 	bm.mu.Unlock()
 
-	go job.run(ctx, cancel, command, dir, bus)
+	go job.run(ctx, cancel, command, args, dir, env, bus)
 
 	return job
 }

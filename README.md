@@ -1,6 +1,6 @@
 # weave-bash
 
-Bash tool extension for [weave](https://github.com/weave-agent/weave) — executes bash commands with streaming output, background execution, and sandbox integration.
+Bash tool extension for [weave](https://github.com/weave-agent/weave) — executes bash commands with streaming output, background execution, guardian checks, and sandbox containment.
 
 ## Fork & Customize
 
@@ -24,6 +24,12 @@ weave install github.com/weave-agent/weave-bash --name bash
 - **Streaming output** — `tool.bash.output` events for each line of stdout/stderr
 - **Progress events** — generic `tool.progress` events with accumulated output (throttled at 200ms) for integration with TUI progress displays
 - **Guardian and sandbox integration** — commands are checked by guardian before active sandbox containment is applied
+
+## Permission Behavior
+
+Command executions are sent to guardian before sandbox wrapping. Guardian allow decisions proceed; block or unresolved ask decisions return `guardian: blocked` with action, rule, and reason. If guardian is unavailable, commands run without guardian checks.
+
+When the sandbox requests an expansion before process start, bash requests approval and retries wrapping once with the approved expansion. Denied expansions return `sandbox expansion denied: <reason>`; repeated expansion requests return `sandbox expansion retry limit reached`.
 
 ## Parameters
 

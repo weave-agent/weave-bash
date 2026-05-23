@@ -3,6 +3,7 @@ package bash
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -14,6 +15,23 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestHelperProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
+		return
+	}
+
+	arg := ""
+	for i, candidate := range os.Args {
+		if candidate == "--" && i+1 < len(os.Args) {
+			arg = os.Args[i+1]
+			break
+		}
+	}
+
+	fmt.Printf("helper:%s:%s", arg, os.Getenv("BASH_WRAPPED_ENV"))
+	os.Exit(0)
+}
 
 // testSandboxer is a minimal Sandboxer implementation for testing.
 type testSandboxer struct {
@@ -948,13 +966,18 @@ func TestExecuteSandboxExpansionRetry(t *testing.T) {
 		assert.Equal(t, 2, wrapCount)
 		assert.Equal(t, true, retryMeta["sandbox_expansion_retry"])
 		assert.Equal(t, "expansion-1", retryMeta["sandbox_expansion_id"])
-		assert.Equal(t, "once", retryMeta["sandbox_expansion_scope"])
+		assert.Equal(t, "expansion-request-1", retryMeta["sandbox_expansion_request_id"])
+		assert.NotContains(t, retryMeta, "sandbox_expansion_scope")
 		mu.Unlock()
 	})
 
 	t.Run("denied wrap expansion returns sandbox expansion error", func(t *testing.T) {
+		wrapCount := 0
+
 		setSandboxer(&testSandboxer{
 			wrapFn: func(_ context.Context, req sdk.SandboxCommandRequest) (sdk.SandboxCommand, error) {
+				wrapCount++
+
 				return sdk.SandboxCommand{}, testSandboxExpansionError{req: sdk.SandboxExpansionRequest{
 					ID:      "expansion-request-denied",
 					Command: req.Command,
@@ -971,60 +994,51 @@ func TestExecuteSandboxExpansionRetry(t *testing.T) {
 			},
 		})
 
-		result, err := (&tool{}).Execute(context.Background(), map[string]any{"command": "printf denied"})
+		result, err := (&tool{}).Execute(context.Background(), map[string]any{"command": "printf SHOULD_NOT_EXECUTE_DENIED_EXPANSION"})
 		require.NoError(t, err)
 		assert.True(t, result.IsError)
 		assert.Contains(t, result.Content, "sandbox expansion denied: operator denied network")
-		assert.NotContains(t, result.Content, "denied\n")
+		assert.NotContains(t, result.Content, "SHOULD_NOT_EXECUTE_DENIED_EXPANSION")
+		assert.Equal(t, 1, wrapCount)
 	})
 
-	t.Run("execution expansion retries failed command once", func(t *testing.T) {
+	t.Run("background execution uses approved wrap expansion", func(t *testing.T) {
 		var (
-			mu        sync.Mutex
 			wrapCount int
+			bgMgr     = NewBackgroundManager()
 		)
 
 		setSandboxer(&testSandboxer{
 			wrapFn: func(_ context.Context, req sdk.SandboxCommandRequest) (sdk.SandboxCommand, error) {
-				mu.Lock()
-				defer mu.Unlock()
-
 				wrapCount++
 				if wrapCount == 1 {
-					return sdk.SandboxCommand{
-						Command: "printf sandbox_denied >&2; exit 1",
-						Metadata: map[string]any{
-							"sandbox_expansion_request": sdk.SandboxExpansionRequest{
-								ID:      "runtime-expansion-request",
-								Command: req.Command,
-								Reason:  "runtime sandbox denial",
-							},
-						},
-					}, nil
+					return sdk.SandboxCommand{}, testSandboxExpansionError{req: sdk.SandboxExpansionRequest{
+						ID:      "background-expansion-request",
+						Command: req.Command,
+						Reason:  "needs background expansion",
+					}}
 				}
 
-				return sdk.SandboxCommand{Command: "printf expanded_runtime"}, nil
+				return sdk.SandboxCommand{Command: "printf expanded_background"}, nil
 			},
 			requestExpansionFn: func(_ context.Context, req sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error) {
 				return sdk.SandboxExpansion{
-					ID:        "runtime-expansion",
+					ID:        "background-expansion",
 					RequestID: req.ID,
 					State:     sdk.SandboxExpansionAllowed,
-					Resolution: &sdk.SandboxExpansionResolution{
-						State: sdk.SandboxExpansionAllowed,
-					},
 				}, nil
 			},
 		})
 
-		result, err := (&tool{}).Execute(context.Background(), map[string]any{"command": "printf original_runtime"})
+		result, err := (&tool{bgMgr: bgMgr, timeout: 10 * time.Second}).Execute(context.Background(), map[string]any{
+			"command":           "printf SHOULD_NOT_RUN_BACKGROUND_ORIGINAL",
+			"run_in_background": true,
+		})
 		require.NoError(t, err)
 		assert.False(t, result.IsError)
-		assert.Equal(t, "expanded_runtime", result.Content)
-
-		mu.Lock()
+		assert.Contains(t, result.Content, "expanded_background")
+		assert.NotContains(t, result.Content, "SHOULD_NOT_RUN_BACKGROUND_ORIGINAL")
 		assert.Equal(t, 2, wrapCount)
-		mu.Unlock()
 	})
 
 	t.Run("expansion retry limit prevents repeated expansion loops", func(t *testing.T) {
@@ -1058,6 +1072,72 @@ func TestExecuteSandboxExpansionRetry(t *testing.T) {
 		assert.Contains(t, result.Content, "sandbox expansion retry limit reached")
 		assert.Equal(t, 2, wrapCount)
 	})
+
+	t.Run("request expansion error returns sandbox expansion error", func(t *testing.T) {
+		setSandboxer(&testSandboxer{
+			wrapFn: func(_ context.Context, req sdk.SandboxCommandRequest) (sdk.SandboxCommand, error) {
+				return sdk.SandboxCommand{}, testSandboxExpansionError{req: sdk.SandboxExpansionRequest{
+					ID:      "expansion-request-error",
+					Command: req.Command,
+				}}
+			},
+			requestExpansionFn: func(context.Context, sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error) {
+				return sdk.SandboxExpansion{}, errors.New("approval service unavailable")
+			},
+		})
+
+		result, err := (&tool{}).Execute(context.Background(), map[string]any{"command": "printf SHOULD_NOT_EXECUTE_EXPANSION_ERROR"})
+		require.NoError(t, err)
+		assert.True(t, result.IsError)
+		assert.Contains(t, result.Content, "sandbox expansion: approval service unavailable")
+		assert.NotContains(t, result.Content, "SHOULD_NOT_EXECUTE_EXPANSION_ERROR")
+	})
+
+	t.Run("denied expansion uses resolution reason and default reason", func(t *testing.T) {
+		result, expansionResult := requestSandboxExpansion(context.Background(), &testSandboxer{
+			requestExpansionFn: func(context.Context, sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error) {
+				return sdk.SandboxExpansion{
+					State: sdk.SandboxExpansionDenied,
+					Resolution: &sdk.SandboxExpansionResolution{
+						Reason: "resolution denied",
+					},
+				}, nil
+			},
+		}, sdk.SandboxExpansionRequest{ID: "denied-with-resolution"})
+		require.Nil(t, result)
+		require.NotNil(t, expansionResult)
+		assert.True(t, expansionResult.IsError)
+		assert.Contains(t, expansionResult.Content, "sandbox expansion denied: resolution denied")
+
+		result, expansionResult = requestSandboxExpansion(context.Background(), &testSandboxer{
+			requestExpansionFn: func(context.Context, sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error) {
+				return sdk.SandboxExpansion{State: sdk.SandboxExpansionDenied}, nil
+			},
+		}, sdk.SandboxExpansionRequest{ID: "denied-without-reason"})
+		require.Nil(t, result)
+		require.NotNil(t, expansionResult)
+		assert.Contains(t, expansionResult.Content, "sandbox expansion denied: expansion was not approved")
+	})
+
+	t.Run("blank expansion request id is generated", func(t *testing.T) {
+		var gotReq sdk.SandboxExpansionRequest
+
+		expansion, expansionResult := requestSandboxExpansion(context.Background(), &testSandboxer{
+			requestExpansionFn: func(_ context.Context, req sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error) {
+				gotReq = req
+
+				return sdk.SandboxExpansion{
+					ID:        "generated-expansion",
+					RequestID: req.ID,
+					State:     sdk.SandboxExpansionAllowed,
+				}, nil
+			},
+		}, sdk.SandboxExpansionRequest{})
+		require.Nil(t, expansionResult)
+		require.NotNil(t, expansion)
+		assert.NotEmpty(t, gotReq.ID)
+		assert.Equal(t, gotReq.ID, expansion.RequestID)
+	})
 }
 
 func TestExecuteGuardianSandboxOrdering(t *testing.T) {
@@ -1073,25 +1153,18 @@ func TestExecuteGuardianSandboxOrdering(t *testing.T) {
 	})
 
 	t.Run("guardian allow runs before sandbox wrapping", func(t *testing.T) {
-		var (
-			mu    sync.Mutex
-			order []string
-		)
+		var order []string
 
 		setGuardian(&testGuardian{
 			decideFn: func(_ context.Context, req sdk.GuardianRequest) (sdk.GuardianDecision, error) {
-				mu.Lock()
 				order = append(order, "guardian")
-				mu.Unlock()
 
 				return sdk.GuardianDecision{RequestID: req.ID, Action: sdk.GuardianDecisionAllow}, nil
 			},
 		})
 		setSandboxer(&testSandboxer{
 			wrapFn: func(_ context.Context, req sdk.SandboxCommandRequest) (sdk.SandboxCommand, error) {
-				mu.Lock()
 				order = append(order, "sandbox")
-				mu.Unlock()
 
 				return sdk.SandboxCommand{Command: req.Command, WorkingDir: req.WorkingDir}, nil
 			},
@@ -1101,23 +1174,15 @@ func TestExecuteGuardianSandboxOrdering(t *testing.T) {
 		require.NoError(t, err)
 		assert.False(t, result.IsError)
 		assert.Equal(t, "order_ok", result.Content)
-
-		mu.Lock()
 		assert.Equal(t, []string{"guardian", "sandbox"}, order)
-		mu.Unlock()
 	})
 
 	t.Run("guardian block skips sandbox wrapping", func(t *testing.T) {
-		var (
-			mu    sync.Mutex
-			order []string
-		)
+		var order []string
 
 		setGuardian(&testGuardian{
 			decideFn: func(_ context.Context, req sdk.GuardianRequest) (sdk.GuardianDecision, error) {
-				mu.Lock()
 				order = append(order, "guardian")
-				mu.Unlock()
 
 				return sdk.GuardianDecision{
 					RequestID: req.ID,
@@ -1128,9 +1193,7 @@ func TestExecuteGuardianSandboxOrdering(t *testing.T) {
 		})
 		setSandboxer(&testSandboxer{
 			wrapFn: func(_ context.Context, req sdk.SandboxCommandRequest) (sdk.SandboxCommand, error) {
-				mu.Lock()
 				order = append(order, "sandbox")
-				mu.Unlock()
 
 				return sdk.SandboxCommand{Command: req.Command, WorkingDir: req.WorkingDir}, nil
 			},
@@ -1140,10 +1203,7 @@ func TestExecuteGuardianSandboxOrdering(t *testing.T) {
 		require.NoError(t, err)
 		assert.True(t, result.IsError)
 		assert.Contains(t, result.Content, "reason: blocked before containment")
-
-		mu.Lock()
 		assert.Equal(t, []string{"guardian"}, order)
-		mu.Unlock()
 	})
 }
 
@@ -1180,6 +1240,31 @@ func TestExecuteUsesSandboxWrappedCommandAndWorkingDir(t *testing.T) {
 		assert.Contains(t, result.Content, wrappedDir)
 		assert.Contains(t, result.Content, "wrapped_foreground")
 		assert.NotContains(t, result.Content, "original_foreground")
+	})
+
+	t.Run("foreground execution uses wrapped args and environment", func(t *testing.T) {
+		setSandboxer(&testSandboxer{
+			wrapFn: func(context.Context, sdk.SandboxCommandRequest) (sdk.SandboxCommand, error) {
+				return sdk.SandboxCommand{
+					Command: os.Args[0],
+					Args: []string{
+						"-test.run=TestHelperProcess",
+						"--",
+						"wrapped_args_env",
+					},
+					Env: []string{
+						"GO_WANT_HELPER_PROCESS=1",
+						"BASH_WRAPPED_ENV=from_sandbox",
+					},
+				}, nil
+			},
+		})
+
+		result, err := (&tool{}).Execute(context.Background(), map[string]any{"command": "printf original_args_env"})
+		require.NoError(t, err)
+		assert.False(t, result.IsError)
+		assert.Contains(t, result.Content, "helper:wrapped_args_env:from_sandbox")
+		assert.NotContains(t, result.Content, "original_args_env")
 	})
 
 	t.Run("background execution uses wrapped command and working directory", func(t *testing.T) {
@@ -1223,6 +1308,49 @@ func TestExecuteUsesSandboxWrappedCommandAndWorkingDir(t *testing.T) {
 		assert.Contains(t, job.Command, "wrapped_background")
 		assert.Contains(t, job.Output(), wrappedDir)
 		assert.Contains(t, job.Output(), "wrapped_background")
+	})
+
+	t.Run("background execution uses wrapped args and environment", func(t *testing.T) {
+		bgMgr := NewBackgroundManager()
+
+		setSandboxer(&testSandboxer{
+			wrapFn: func(context.Context, sdk.SandboxCommandRequest) (sdk.SandboxCommand, error) {
+				return sdk.SandboxCommand{
+					Command: os.Args[0],
+					Args: []string{
+						"-test.run=TestHelperProcess",
+						"--",
+						"wrapped_background_args_env",
+					},
+					Env: []string{
+						"GO_WANT_HELPER_PROCESS=1",
+						"BASH_WRAPPED_ENV=from_background_sandbox",
+					},
+				}, nil
+			},
+		})
+
+		result, err := (&tool{bgMgr: bgMgr, timeout: 10 * time.Second}).Execute(context.Background(), map[string]any{
+			"command":           "printf original_background_args_env",
+			"run_in_background": true,
+		})
+		require.NoError(t, err)
+		assert.False(t, result.IsError)
+		assert.NotContains(t, result.Content, "original_background_args_env")
+
+		var jobID string
+		for line := range strings.SplitSeq(result.Content, "\n") {
+			if id, ok := strings.CutPrefix(line, "Background job started: "); ok {
+				jobID = id
+				break
+			}
+		}
+
+		require.NotEmpty(t, jobID)
+		job, ok := bgMgr.Get(jobID)
+		require.True(t, ok)
+		job.Wait()
+		assert.Contains(t, job.Output(), "helper:wrapped_background_args_env:from_background_sandbox")
 	})
 }
 
@@ -1376,7 +1504,7 @@ func TestExecuteAutoBackground(t *testing.T) {
 
 func TestBackgroundJobNonZeroExitCode(t *testing.T) {
 	bgMgr := NewBackgroundManager()
-	job := bgMgr.Start("exit 42", "", 10*time.Second, nil)
+	job := bgMgr.Start("exit 42", nil, "", nil, 10*time.Second, nil)
 	job.Wait()
 
 	assert.Equal(t, 42, job.ExitCode())
@@ -1390,7 +1518,7 @@ func TestBackgroundJobNonZeroExitCode(t *testing.T) {
 func TestBackgroundManagerOutput(t *testing.T) {
 	t.Run("returns output for existing job", func(t *testing.T) {
 		bgMgr := NewBackgroundManager()
-		job := bgMgr.Start("echo output_test", "", 10*time.Second, nil)
+		job := bgMgr.Start("echo output_test", nil, "", nil, 10*time.Second, nil)
 
 		job.Wait()
 
@@ -1410,7 +1538,7 @@ func TestBackgroundManagerOutput(t *testing.T) {
 func TestBackgroundManagerKill(t *testing.T) {
 	t.Run("kills a running background job", func(t *testing.T) {
 		bgMgr := NewBackgroundManager()
-		job := bgMgr.Start("sleep 30", "", 60*time.Second, nil)
+		job := bgMgr.Start("sleep 30", nil, "", nil, 60*time.Second, nil)
 
 		// Give the job a moment to start
 		time.Sleep(100 * time.Millisecond)
@@ -1437,8 +1565,8 @@ func TestBackgroundManagerList(t *testing.T) {
 
 	assert.Empty(t, bgMgr.List())
 
-	job1 := bgMgr.Start("echo one", "", 10*time.Second, nil)
-	job2 := bgMgr.Start("echo two", "", 10*time.Second, nil)
+	job1 := bgMgr.Start("echo one", nil, "", nil, 10*time.Second, nil)
+	job2 := bgMgr.Start("echo two", nil, "", nil, 10*time.Second, nil)
 
 	jobs := bgMgr.List()
 	assert.Len(t, jobs, 2)
@@ -1518,7 +1646,7 @@ func TestBackgroundJobBusEvents(t *testing.T) {
 		bus := &recordingBus{}
 		bgMgr := NewBackgroundManager()
 
-		job := bgMgr.Start("sleep 30", "", 60*time.Second, bus)
+		job := bgMgr.Start("sleep 30", nil, "", nil, 60*time.Second, bus)
 
 		time.Sleep(100 * time.Millisecond)
 
@@ -1547,7 +1675,7 @@ func TestBackgroundJobBusEvents(t *testing.T) {
 
 func TestBackgroundManagerRemove(t *testing.T) {
 	bgMgr := NewBackgroundManager()
-	job := bgMgr.Start("echo hello", "", 10*time.Second, nil)
+	job := bgMgr.Start("echo hello", nil, "", nil, 10*time.Second, nil)
 	job.Wait()
 
 	// Verify job exists
@@ -1567,7 +1695,7 @@ func TestBackgroundJobPartialLine(t *testing.T) {
 	bgMgr := NewBackgroundManager()
 
 	// printf without trailing newline produces a partial line
-	job := bgMgr.Start("printf 'no newline'", "", 10*time.Second, bus)
+	job := bgMgr.Start("printf 'no newline'", nil, "", nil, 10*time.Second, bus)
 	job.Wait()
 
 	time.Sleep(50 * time.Millisecond)

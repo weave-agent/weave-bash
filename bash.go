@@ -43,16 +43,14 @@ type tool struct {
 
 type executionPlan struct {
 	command      string
+	args         []string
 	dir          string
+	env          []string
 	expansionReq *sdk.SandboxExpansionRequest
 }
 
 type sandboxExpansionRequestError interface {
 	SandboxExpansionRequest() sdk.SandboxExpansionRequest
-}
-
-type expansionRequestError interface {
-	ExpansionRequest() sdk.SandboxExpansionRequest
 }
 
 // defaultBgMgr is the shared background manager across all bash tool instances.
@@ -322,14 +320,6 @@ func sandboxPlan(ctx context.Context, s sdk.Sandboxer, command, dir, guardianReq
 		metadata["sandbox_expansion_id"] = expansion.ID
 		metadata["sandbox_expansion_request_id"] = expansion.RequestID
 		metadata["sandbox_expansion_retry"] = true
-		if expansion.Resolution != nil {
-			metadata["sandbox_expansion_resolution"] = *expansion.Resolution
-			if expansion.Resolution.Metadata != nil {
-				for k, v := range expansion.Resolution.Metadata {
-					metadata["sandbox_expansion_"+k] = v
-				}
-			}
-		}
 	}
 
 	wrapped, err := s.WrapCommand(ctx, sdk.SandboxCommandRequest{
@@ -349,6 +339,12 @@ func sandboxPlan(ctx context.Context, s sdk.Sandboxer, command, dir, guardianReq
 	}
 
 	plan.command = wrapped.Command
+	if len(wrapped.Args) > 0 {
+		plan.args = append([]string(nil), wrapped.Args...)
+	}
+	if len(wrapped.Env) > 0 {
+		plan.env = append([]string(nil), wrapped.Env...)
+	}
 	if wrapped.WorkingDir != "" {
 		plan.dir = wrapped.WorkingDir
 	}
@@ -365,22 +361,12 @@ func expansionRequestFromError(err error) (sdk.SandboxExpansionRequest, bool) {
 		return sandboxErr.SandboxExpansionRequest(), true
 	}
 
-	var expansionErr expansionRequestError
-	if errors.As(err, &expansionErr) {
-		return expansionErr.ExpansionRequest(), true
-	}
-
 	return sdk.SandboxExpansionRequest{}, false
 }
 
 func expansionRequestFromMetadata(metadata map[string]any) (sdk.SandboxExpansionRequest, bool) {
-	for _, key := range []string{"sandbox_expansion_request", "expansion_request"} {
-		if req, ok := metadata[key].(sdk.SandboxExpansionRequest); ok {
-			return req, true
-		}
-		if req, ok := metadata[key].(*sdk.SandboxExpansionRequest); ok && req != nil {
-			return *req, true
-		}
+	if req, ok := metadata["sandbox_expansion_request"].(sdk.SandboxExpansionRequest); ok {
+		return req, true
 	}
 
 	return sdk.SandboxExpansionRequest{}, false
@@ -454,7 +440,9 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 	}
 
 	command = plan.command
+	execArgs := plan.args
 	execDir = plan.dir
+	execEnv := plan.env
 
 	timeout := resolveTimeout(args, t.timeout)
 	runInBackground, _ := args["run_in_background"].(bool)
@@ -474,7 +462,7 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 			return sdk.ToolResult{Content: "error: background manager not available", IsError: true}, nil
 		}
 
-		job := t.bgMgr.Start(command, execDir, timeout, bus)
+		job := t.bgMgr.Start(command, execArgs, execDir, execEnv, timeout, bus)
 
 		return sdk.ToolResult{
 			Content: fmt.Sprintf("Background job started: %s\nCommand: %s\nWait for completion or check output later.", job.ID, command),
@@ -486,7 +474,7 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 			return sdk.ToolResult{Content: "error: background manager not available", IsError: true}, nil
 		}
 
-		job := t.bgMgr.Start(command, execDir, timeout, bus)
+		job := t.bgMgr.Start(command, execArgs, execDir, execEnv, timeout, bus)
 
 		timer := time.NewTimer(time.Duration(autoBackgroundAfter) * time.Second)
 		defer timer.Stop()
@@ -516,30 +504,7 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 		}
 	}
 
-	result, execErr, waitErr := t.executeSync(ctx, command, execDir, timeout, bus)
-	if execErr != nil {
-		return result, execErr
-	}
-	if waitErr == nil || plan.expansionReq == nil || s == nil {
-		return result, nil
-	}
-
-	expansion, expansionResult := requestSandboxExpansion(ctx, s, *plan.expansionReq)
-	if expansionResult != nil {
-		return *expansionResult, nil
-	}
-
-	retryPlan, planResult := sandboxPlan(ctx, s, originalCommand, t.dir, guardianReq.ID, expansion)
-	if planResult != nil {
-		return *planResult, nil
-	}
-	if retryPlan.expansionReq != nil {
-		return sdk.ToolResult{Content: "sandbox expansion retry limit reached", IsError: true}, nil
-	}
-
-	result, execErr, _ = t.executeSync(ctx, retryPlan.command, retryPlan.dir, timeout, bus)
-
-	return result, execErr
+	return t.executeSync(ctx, command, execArgs, execDir, execEnv, timeout, bus)
 }
 
 func (t *tool) checkJob(jobID string) sdk.ToolResult {
@@ -597,11 +562,11 @@ func (t *tool) killJob(jobID string) sdk.ToolResult {
 	return sdk.ToolResult{Content: content, IsError: false}
 }
 
-func (t *tool) executeSync(ctx context.Context, command, dir string, timeout time.Duration, bus sdk.Bus) (sdk.ToolResult, error, error) {
+func (t *tool) executeSync(ctx context.Context, command string, args []string, dir string, env []string, timeout time.Duration, bus sdk.Bus) (sdk.ToolResult, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "bash", "-c", command)
+	cmd := newExecCommand(ctx, command, args, env)
 
 	if dir != "" {
 		if info, err := os.Stat(dir); err == nil && info.IsDir() {
@@ -629,21 +594,21 @@ func (t *tool) executeSync(ctx context.Context, command, dir string, timeout tim
 
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
-		return sdk.ToolResult{Content: "error: " + err.Error(), IsError: true}, nil, err
+		return sdk.ToolResult{Content: "error: " + err.Error(), IsError: true}, nil
 	}
 
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
 		_ = stdoutPipe.Close()
 
-		return sdk.ToolResult{Content: "error: " + err.Error(), IsError: true}, nil, err
+		return sdk.ToolResult{Content: "error: " + err.Error(), IsError: true}, nil
 	}
 
 	if err := cmd.Start(); err != nil {
 		_ = stdoutPipe.Close()
 		_ = stderrPipe.Close()
 
-		return sdk.ToolResult{Content: "error: " + err.Error(), IsError: true}, nil, err
+		return sdk.ToolResult{Content: "error: " + err.Error(), IsError: true}, nil
 	}
 
 	var outBuf strings.Builder
@@ -685,12 +650,30 @@ func (t *tool) executeSync(ctx context.Context, command, dir string, timeout tim
 
 	if waitErr == nil {
 		result := truncate.Truncate(fullOutput, truncate.DefaultMaxLines, truncate.DefaultMaxBytes)
-		return sdk.ToolResult{Content: formatResultWithTempFile(result, fullOutput)}, nil, nil
+		return sdk.ToolResult{Content: formatResultWithTempFile(result, fullOutput)}, nil
 	}
 
 	content, isErr := formatCmdError(fullOutput, waitErr, ctx)
 
-	return sdk.ToolResult{Content: content, IsError: isErr}, nil, waitErr
+	return sdk.ToolResult{Content: content, IsError: isErr}, nil
+}
+
+func newExecCommand(ctx context.Context, command string, args []string, env []string) *exec.Cmd {
+	if len(args) > 0 {
+		cmd := exec.CommandContext(ctx, command, args...)
+		if len(env) > 0 {
+			cmd.Env = append(os.Environ(), env...)
+		}
+
+		return cmd
+	}
+
+	cmd := exec.CommandContext(ctx, "bash", "-c", command)
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
+	}
+
+	return cmd
 }
 
 // syncWriter wraps a strings.Builder with a mutex for safe concurrent writes.

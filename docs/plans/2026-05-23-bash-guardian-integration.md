@@ -93,14 +93,19 @@ Update the bash tool to call guardian before execution and sandbox after guardia
 resolve operation
   -> guardian.Decide
   -> sandbox.WrapCommand
-  -> execute command
-  -> optional expansion retry
+  -> optional sandbox expansion request and one re-wrap before process start
+  -> execute wrapped command
 ```
 
 ### Background behavior
 Background commands still pass through guardian and sandbox before job creation.
 
 ## Post-Completion
+
+**Implementation status**:
+- Completed on 2026-05-23.
+- Verified with `go test ./...`.
+- No Makefile or configured linter found; verified with `go vet ./...`.
 
 **Manual verification**:
 - Run allowed command: `git status`.
