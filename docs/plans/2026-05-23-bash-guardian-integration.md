@@ -80,11 +80,11 @@ Update the bash tool to call guardian before execution and sandbox after guardia
 - [x] run `go test ./...` - must pass before task 6
 
 ### Task 6: Verify acceptance criteria
-- [ ] verify bash no longer calls `AllowRead`, `AllowWrite`, `Mode`, or `SetMode`
-- [ ] verify block output includes guardian action and reason
-- [ ] run full test suite with `go test ./...`
-- [ ] run linter if configured
-- [ ] update README.md if command permission behavior is documented
+- [x] verify bash no longer calls `AllowRead`, `AllowWrite`, `Mode`, or `SetMode`
+- [x] verify block output includes guardian action and reason
+- [x] run full test suite with `go test ./...`
+- [x] run linter if configured
+- [x] update README.md if command permission behavior is documented
 
 ## Technical Details
 

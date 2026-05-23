@@ -23,7 +23,7 @@ weave install github.com/weave-agent/weave-bash --name bash
 - **Auto-background** — start synchronously and automatically move to background after N seconds with `auto_background_after`
 - **Streaming output** — `tool.bash.output` events for each line of stdout/stderr
 - **Progress events** — generic `tool.progress` events with accumulated output (throttled at 200ms) for integration with TUI progress displays
-- **Sandbox integration** — commands are wrapped by the active sandbox when available
+- **Guardian and sandbox integration** — commands are checked by guardian before active sandbox containment is applied
 
 ## Parameters
 
